@@ -1,0 +1,12 @@
+# One tournament URL or slug per line.
+# Lines starting with # are ignored.
+https://www.metaculus.com/tournament/market-pulse-26q1/
+https://www.metaculus.com/tournament/climate/
+https://www.metaculus.com/tournament/sagan-tournament/
+https://www.metaculus.com/tournament/foresight-ai-pathways/
+https://www.metaculus.com/tournament/POTUS-predictions/
+https://www.metaculus.com/index/us-democracy-threat/
+https://www.metaculus.com/tournament/metaculus-cup-spring-2026/
+https://www.metaculus.com/tournament/ACX2026/
+https://www.metaculus.com/tournament/spring-aib-2026/
+https://www.metaculus.com/tournament/bridgewater/
