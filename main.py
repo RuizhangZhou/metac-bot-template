@@ -181,11 +181,21 @@ if __name__ == "__main__":
     if args.researcher and llms is not None:
         llms["researcher"] = args.researcher
     if args.default_model and llms is not None:
-        llms["default"] = GeneralLlm(
+        default_llm = GeneralLlm(
             model=args.default_model,
             temperature=0.3,
             timeout=60,
             allowed_tries=2,
+        )
+        llms["default"] = default_llm
+        llms.setdefault(
+            "summarizer",
+            GeneralLlm(
+                model=args.default_model,
+                temperature=0.0,
+                timeout=60,
+                allowed_tries=2,
+            ),
         )
     if args.parser_model and llms is not None:
         llms["parser"] = GeneralLlm(
