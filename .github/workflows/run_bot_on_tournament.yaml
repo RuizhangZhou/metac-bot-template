@@ -39,7 +39,7 @@ on:
         default: "false"
         type: string
   schedule:
-    - cron: "0 2 * * *" # daily at 02:00 UTC (adjust as desired)
+    - cron: "*/30 * * * *" # every 30 minutes
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -83,7 +83,7 @@ jobs:
           SMART_SEARCHER_NUM_SITES_PER_SEARCH="${{ github.event.inputs.smart_searcher_num_sites_per_search }}"
           SMART_SEARCHER_USE_ADVANCED_FILTERS="${{ github.event.inputs.smart_searcher_use_advanced_filters }}"
 
-          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="spring-aib-2026"; fi
+          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${AIB_TOURNAMENT:-spring-aib-2026}"; fi
           if [ -z "$RESEARCHER" ]; then RESEARCHER="smart-searcher/openrouter/openai/gpt-4o-mini"; fi
           if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-4o-mini"; fi
           if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-4o-mini"; fi
@@ -107,6 +107,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          AIB_TOURNAMENT: ${{ vars.AIB_TOURNAMENT }}
           MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
           MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}

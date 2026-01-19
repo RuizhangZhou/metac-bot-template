@@ -9,7 +9,12 @@ from typing import Literal
 import dotenv
 import requests
 
-from digest_mode import load_tournament_identifiers, matrix_send_message, run_digest
+from digest_mode import (
+    extract_tournament_identifier,
+    load_tournament_identifiers,
+    matrix_send_message,
+    run_digest,
+)
 from forecasting_tools import GeneralLlm, MetaculusClient
 
 from template_bot_2026 import SpringTemplateBot2026
@@ -315,9 +320,22 @@ if __name__ == "__main__":
 
         elif run_mode == "metaculus_cup":
             template_bot.skip_previously_forecasted_questions = False
+            cup_override_raw = os.getenv("METACULUS_CUP_TOURNAMENT", "").strip()
+            cup_override = (
+                extract_tournament_identifier(cup_override_raw)
+                if cup_override_raw
+                else None
+            )
+            if cup_override and cup_override.startswith("index:"):
+                logging.getLogger(__name__).warning(
+                    f"Ignoring METACULUS_CUP_TOURNAMENT={cup_override_raw!r} because it is an index, not a tournament."
+                )
+                cup_override = None
+
+            metaculus_cup_id = cup_override or "metaculus-cup-spring-2026"
             forecast_reports = asyncio.run(
                 template_bot.forecast_on_tournament(
-                    client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+                    metaculus_cup_id, return_exceptions=True
                 )
             )
 
