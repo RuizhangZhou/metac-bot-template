@@ -145,6 +145,27 @@ class SpringTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    @staticmethod
+    def _resolution_criteria_research_guardrails() -> str:
+        return clean_indents(
+            """
+            Priority: Interpret the Resolution Criteria and Fine Print literally (they are the contract).
+            First, restate what would count as each possible resolution per the criteria, and list any ambiguous terms.
+            When you cite outside information, explicitly connect it back to the criteria.
+            """
+        )
+
+    @staticmethod
+    def _resolution_criteria_forecast_guardrails() -> str:
+        return clean_indents(
+            """
+            Resolution criteria guardrails:
+            - Treat the Resolution Criteria and Fine Print as the contract; do not "guess" the intended resolution.
+            - Tie key claims in your reasoning to the criteria (and to dated sources when possible).
+            - If the criteria are ambiguous or required facts are unavailable, state the ambiguity and your assumptions.
+            """
+        )
+
     @classmethod
     def _llm_config_defaults(cls) -> dict[str, str | GeneralLlm | None]:
         """
@@ -290,6 +311,8 @@ class SpringTemplateBot2026(ForecastBot):
                 If you find a relevant market, report the current implied probability (or price) as a percentage and include a direct link.
                 If you cannot find a relevant market, explicitly say so. Do not invent links or probabilities.
 
+                {self._resolution_criteria_research_guardrails()}
+
                 Question:
                 {question.question_text}
 
@@ -379,6 +402,8 @@ class SpringTemplateBot2026(ForecastBot):
 
             {question.fine_print}
 
+            {self._resolution_criteria_forecast_guardrails()}
+
 
             Your research assistant says:
             {research}
@@ -441,6 +466,8 @@ class SpringTemplateBot2026(ForecastBot):
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            {self._resolution_criteria_forecast_guardrails()}
 
 
             Your research assistant says:
@@ -517,6 +544,8 @@ class SpringTemplateBot2026(ForecastBot):
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            {self._resolution_criteria_forecast_guardrails()}
 
             Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
 
@@ -611,6 +640,8 @@ class SpringTemplateBot2026(ForecastBot):
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            {self._resolution_criteria_forecast_guardrails()}
 
             Your research assistant says:
             {research}
