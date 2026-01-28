@@ -18,8 +18,8 @@ on:
         required: false
         default: "openrouter/openai/gpt-4o-mini"
         type: string
-  schedule:
-    - cron: "0 12 * * *" # daily at 20:00 Asia/Shanghai (12:00 UTC)
+  # schedule:
+  #   - cron: "0 12 * * *" # daily at 20:00 Asia/Shanghai (12:00 UTC)
 
 concurrency:
   group: ${{ github.workflow }}
