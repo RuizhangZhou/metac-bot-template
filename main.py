@@ -340,12 +340,15 @@ if __name__ == "__main__":
             )
 
         elif run_mode == "test_questions":
-            EXAMPLE_QUESTIONS = [
-                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
-                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
-                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
+            # Quick test: only 1 question by default (set BOT_TEST_QUESTION_COUNT for more)
+            ALL_EXAMPLE_QUESTIONS = [
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Binary
+                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Numeric
+                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Multiple Choice
+                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Discrete
             ]
+            test_count = _env_int("BOT_TEST_QUESTION_COUNT", 1)
+            EXAMPLE_QUESTIONS = ALL_EXAMPLE_QUESTIONS[:test_count]
             template_bot.skip_previously_forecasted_questions = False
             questions = [
                 client.get_question_by_url(question_url)
