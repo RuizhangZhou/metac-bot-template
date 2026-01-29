@@ -157,6 +157,7 @@ class SpringTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    _using_fallback_model = False  # Track if we've switched to fallback model
 
     @staticmethod
     def _resolution_criteria_research_guardrails() -> str:
@@ -188,9 +189,10 @@ class SpringTemplateBot2026(ForecastBot):
         - Use a *search* model for research only (ideally 1 call per question).
 
         Env overrides:
-        - BOT_BASE_MODEL: non-search model (default: OpenRouter gpt-4o-mini)
+        - BOT_BASE_MODEL: non-search model (default: OpenRouter gpt-oss-120b:free)
         - BOT_SEARCH_MODEL: web-search model (default: OpenRouter gpt-4o-mini-search-preview)
         - BOT_ENABLE_WEB_SEARCH: set to 0/false to disable research
+        - BOT_ENABLE_REASONING: set to 1/true to enable OpenRouter reasoning (default: true for gpt-oss models)
         - BOT_SINGLE_MODEL: use one model for everything (debug/experiments)
         """
 
@@ -199,7 +201,7 @@ class SpringTemplateBot2026(ForecastBot):
             base_model = os.getenv("BOT_BASE_MODEL", "").strip()
             if not base_model:
                 if os.getenv("OPENROUTER_API_KEY"):
-                    base_model = "openrouter/openai/gpt-4o-mini"
+                    base_model = "openrouter/openai/gpt-oss-120b:free"
                 elif os.getenv("OPENAI_API_KEY"):
                     base_model = "openai/gpt-4o-mini"
                 else:
@@ -216,10 +218,20 @@ class SpringTemplateBot2026(ForecastBot):
 
             enable_web_search = _env_bool("BOT_ENABLE_WEB_SEARCH", True)
 
+            # Enable reasoning for OpenRouter models (gpt-oss, etc.)
+            # Default: enabled for gpt-oss models
+            default_enable_reasoning = "gpt-oss" in base_model.lower()
+            enable_reasoning = _env_bool("BOT_ENABLE_REASONING", default_enable_reasoning)
+
+            # Extra body for OpenRouter reasoning
+            extra_kwargs: dict = {}
+            if enable_reasoning and "openrouter/" in base_model.lower():
+                extra_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
+
             return {
-                "default": GeneralLlm(model=base_model, temperature=0.3),
-                "summarizer": GeneralLlm(model=base_model, temperature=0.0),
-                "parser": GeneralLlm(model=base_model, temperature=0.0),
+                "default": GeneralLlm(model=base_model, temperature=0.3, timeout=120, **extra_kwargs),
+                "summarizer": GeneralLlm(model=base_model, temperature=0.0, timeout=120, **extra_kwargs),
+                "parser": GeneralLlm(model=base_model, temperature=0.0, timeout=120, **extra_kwargs),
                 "researcher": (
                     GeneralLlm(model=search_model, temperature=0.0)
                     if enable_web_search
@@ -236,6 +248,45 @@ class SpringTemplateBot2026(ForecastBot):
             "researcher": deterministic_llm,
             "parser": deterministic_llm,
         }
+
+    def _switch_to_fallback_model(self) -> bool:
+        """
+        Switch from free model to paid fallback model.
+        Returns True if switch was successful, False if no fallback available.
+        """
+        if self._using_fallback_model:
+            return False  # Already using fallback
+
+        fallback_model = os.getenv("BOT_FALLBACK_MODEL", "").strip()
+        if not fallback_model:
+            # Auto-detect fallback: remove :free suffix
+            current_default = self.get_llm("default")
+            if isinstance(current_default, GeneralLlm):
+                current_model = current_default.model
+                if ":free" in current_model:
+                    fallback_model = current_model.replace(":free", "")
+                else:
+                    return False
+            else:
+                return False
+
+        logger.warning(
+            f"Switching to fallback model: {fallback_model} (due to rate limit on free model)"
+        )
+
+        # Enable reasoning for fallback model too
+        enable_reasoning = _env_bool("BOT_ENABLE_REASONING", "gpt-oss" in fallback_model.lower())
+        extra_kwargs: dict = {}
+        if enable_reasoning and "openrouter/" in fallback_model.lower():
+            extra_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
+
+        # Update llms config
+        self.llms["default"] = GeneralLlm(model=fallback_model, temperature=0.3, timeout=120, **extra_kwargs)
+        self.llms["summarizer"] = GeneralLlm(model=fallback_model, temperature=0.0, timeout=120, **extra_kwargs)
+        self.llms["parser"] = GeneralLlm(model=fallback_model, temperature=0.0, timeout=120, **extra_kwargs)
+
+        self._using_fallback_model = True
+        return True
 
     ################################# CONCURRENCY ###################################
 
@@ -283,13 +334,37 @@ class SpringTemplateBot2026(ForecastBot):
                         )
                     )
                 except BaseException as e:
+                    error_str = str(e).lower()
+                    is_rate_limit = (
+                        "free-models-per-day" in error_str
+                        or "rate_limit" in error_str
+                        or "rate limit" in error_str
+                        or "quota" in error_str
+                    )
+
+                    # Try to switch to fallback model and retry
+                    if is_rate_limit and self._switch_to_fallback_model():
+                        logger.info(f"Retrying question with fallback model: {question.page_url}")
+                        try:
+                            reports.append(
+                                await self._run_individual_question_with_error_propagation(
+                                    question
+                                )
+                            )
+                            continue  # Success with fallback, continue to next question
+                        except BaseException as fallback_e:
+                            if not return_exceptions:
+                                raise
+                            reports.append(fallback_e)
+                            logger.error(f"Fallback model also failed: {fallback_e}")
+                            continue
+
                     if not return_exceptions:
                         raise
                     reports.append(e)
-                    if "free-models-per-day" in str(e):
+                    if "free-models-per-day" in error_str:
                         logger.error(
-                            "OpenRouter free model daily quota exhausted; stopping early. "
-                            "Use a paid model (e.g. openrouter/openai/gpt-oss-20b) or add credits to raise free quotas."
+                            "OpenRouter free model daily quota exhausted and no fallback available; stopping early."
                         )
                         break
         else:

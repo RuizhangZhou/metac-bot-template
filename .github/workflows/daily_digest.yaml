@@ -9,14 +9,14 @@ on:
         default: "no_research"
         type: string
       default_model:
-        description: "Override default LLM model (Litellm format), e.g. openrouter/openai/gpt-4o-mini"
+        description: "Override default LLM model (Litellm format), e.g. openrouter/openai/gpt-oss-120b:free"
         required: false
-        default: "openrouter/openai/gpt-4o-mini"
+        default: "openrouter/openai/gpt-oss-120b:free"
         type: string
       parser_model:
-        description: "Override parser LLM model (Litellm format), e.g. openrouter/openai/gpt-4o-mini"
+        description: "Override parser LLM model (Litellm format), e.g. openrouter/openai/gpt-oss-120b:free"
         required: false
-        default: "openrouter/openai/gpt-4o-mini"
+        default: "openrouter/openai/gpt-oss-120b:free"
         type: string
   # schedule:
   #   - cron: "0 12 * * *" # daily at 20:00 Asia/Shanghai (12:00 UTC)
@@ -61,8 +61,8 @@ jobs:
           DEFAULT_MODEL="${{ github.event.inputs.default_model }}"
           PARSER_MODEL="${{ github.event.inputs.parser_model }}"
           if [ -z "$RESEARCHER" ]; then RESEARCHER="no_research"; fi
-          if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-4o-mini"; fi
-          if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-4o-mini"; fi
+          if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
+          if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
           poetry run python main.py --mode digest --researcher "$RESEARCHER" --default-model "$DEFAULT_MODEL" --parser-model "$PARSER_MODEL"
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}

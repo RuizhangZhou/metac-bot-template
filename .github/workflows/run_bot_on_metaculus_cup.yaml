@@ -16,12 +16,12 @@ on:
       default_model:
         description: "Default LLM model (Litellm format)"
         required: false
-        default: "openrouter/openai/gpt-4o-mini"
+        default: "openrouter/openai/gpt-oss-120b:free"
         type: string
       parser_model:
         description: "Parser LLM model (Litellm format)"
         required: false
-        default: "openrouter/openai/gpt-4o-mini"
+        default: "openrouter/openai/gpt-oss-120b:free"
         type: string
 
 # Add concurrency group to prevent parallel runs
@@ -58,8 +58,8 @@ jobs:
           PARSER_MODEL="${{ github.event.inputs.parser_model }}"
           if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${METACULUS_CUP_TOURNAMENT:-metaculus-cup-spring-2026}"; fi
           if [ -z "$RESEARCHER" ]; then RESEARCHER="no_research"; fi
-          if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-4o-mini"; fi
-          if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-4o-mini"; fi
+          if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
+          if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
 
           export METACULUS_CUP_TOURNAMENT="$TOURNAMENT"
           poetry run python main.py --mode metaculus_cup --researcher "$RESEARCHER" --default-model "$DEFAULT_MODEL" --parser-model "$PARSER_MODEL" --submit
