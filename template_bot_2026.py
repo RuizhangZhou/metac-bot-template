@@ -157,7 +157,79 @@ class SpringTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
-    _using_fallback_model = False  # Track if we've switched to fallback model
+
+    @staticmethod
+    def _is_transient_provider_error(error: BaseException) -> bool:
+        error_name = error.__class__.__name__.lower()
+        error_text = str(error).lower()
+
+        if "ratelimit" in error_name:
+            return True
+        if "timeout" in error_name:
+            return True
+        if "rate limit" in error_text or "rate_limit" in error_text:
+            return True
+        if "timed out" in error_text or "timeout" in error_text:
+            return True
+        if "free-models-per-day" in error_text or "quota" in error_text:
+            return True
+        if "temporarily rate-limited" in error_text or "rate-limited upstream" in error_text:
+            return True
+        if '"code":429' in error_text or " 429" in error_text:
+            return True
+        return False
+
+    @staticmethod
+    def _fallback_model_name_for(model_name: str) -> str | None:
+        configured = os.getenv("BOT_FALLBACK_MODEL", "").strip()
+        if configured:
+            return configured
+        if model_name.endswith(":free"):
+            return model_name[: -len(":free")]
+        return None
+
+    def _make_fallback_llm(self, purpose: str) -> GeneralLlm | None:
+        if not _env_bool("BOT_ENABLE_FALLBACK", True):
+            return None
+
+        base_llm = self.get_llm(purpose, "llm")
+        base_model = base_llm.model
+        fallback_model = self._fallback_model_name_for(base_model)
+        if not fallback_model or fallback_model == base_model:
+            return None
+
+        fallback_timeout = float(_env_int("BOT_FALLBACK_TIMEOUT_SECONDS", 120))
+        fallback_allowed_tries = _env_int("BOT_FALLBACK_ALLOWED_TRIES", 2)
+        temperature = base_llm.litellm_kwargs.get("temperature", 0.0)
+
+        extra_kwargs: dict = {}
+        if base_llm.litellm_kwargs.get("extra_body") is not None:
+            extra_kwargs["extra_body"] = base_llm.litellm_kwargs["extra_body"]
+
+        return GeneralLlm(
+            model=fallback_model,
+            temperature=temperature,
+            timeout=fallback_timeout,
+            allowed_tries=fallback_allowed_tries,
+            **extra_kwargs,
+        )
+
+    async def _invoke_llm_with_transient_fallback(
+        self, purpose: str, prompt: str, *, context: str
+    ) -> str:
+        base_llm = self.get_llm(purpose, "llm")
+        try:
+            return await base_llm.invoke(prompt)
+        except BaseException as e:
+            if not self._is_transient_provider_error(e):
+                raise
+            fallback_llm = self._make_fallback_llm(purpose)
+            if fallback_llm is None:
+                raise
+            logger.warning(
+                f"{context}: base model '{base_llm.model}' failed; retrying once with fallback '{fallback_llm.model}'. Error: {e}"
+            )
+            return await fallback_llm.invoke(prompt)
 
     @staticmethod
     def _resolution_criteria_research_guardrails() -> str:
@@ -193,6 +265,12 @@ class SpringTemplateBot2026(ForecastBot):
         - BOT_SEARCH_MODEL: web-search model (default: OpenRouter gpt-4o-mini-search-preview)
         - BOT_ENABLE_WEB_SEARCH: set to 0/false to disable research
         - BOT_ENABLE_REASONING: set to 1/true to enable OpenRouter reasoning (default: true for gpt-oss models)
+        - BOT_BASE_TIMEOUT_SECONDS: timeout for base model calls (default: 45)
+        - BOT_BASE_ALLOWED_TRIES: retry count for base model (default: 1 if :free else 2)
+        - BOT_ENABLE_FALLBACK: set to 0/false to disable fallback retries
+        - BOT_FALLBACK_MODEL: paid fallback model (default: base model without :free)
+        - BOT_FALLBACK_TIMEOUT_SECONDS: timeout for fallback calls (default: 120)
+        - BOT_FALLBACK_ALLOWED_TRIES: retry count for fallback calls (default: 2)
         - BOT_SINGLE_MODEL: use one model for everything (debug/experiments)
         """
 
@@ -218,6 +296,12 @@ class SpringTemplateBot2026(ForecastBot):
 
             enable_web_search = _env_bool("BOT_ENABLE_WEB_SEARCH", True)
 
+            base_timeout = float(_env_int("BOT_BASE_TIMEOUT_SECONDS", 45))
+            base_allowed_tries_default = 1 if base_model.endswith(":free") else 2
+            base_allowed_tries = _env_int(
+                "BOT_BASE_ALLOWED_TRIES", base_allowed_tries_default
+            )
+
             # Enable reasoning for OpenRouter models (gpt-oss, etc.)
             # Default: enabled for gpt-oss models
             default_enable_reasoning = "gpt-oss" in base_model.lower()
@@ -229,9 +313,27 @@ class SpringTemplateBot2026(ForecastBot):
                 extra_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
 
             return {
-                "default": GeneralLlm(model=base_model, temperature=0.3, timeout=120, **extra_kwargs),
-                "summarizer": GeneralLlm(model=base_model, temperature=0.0, timeout=120, **extra_kwargs),
-                "parser": GeneralLlm(model=base_model, temperature=0.0, timeout=120, **extra_kwargs),
+                "default": GeneralLlm(
+                    model=base_model,
+                    temperature=0.3,
+                    timeout=base_timeout,
+                    allowed_tries=base_allowed_tries,
+                    **extra_kwargs,
+                ),
+                "summarizer": GeneralLlm(
+                    model=base_model,
+                    temperature=0.0,
+                    timeout=base_timeout,
+                    allowed_tries=base_allowed_tries,
+                    **extra_kwargs,
+                ),
+                "parser": GeneralLlm(
+                    model=base_model,
+                    temperature=0.0,
+                    timeout=base_timeout,
+                    allowed_tries=base_allowed_tries,
+                    **extra_kwargs,
+                ),
                 "researcher": (
                     GeneralLlm(model=search_model, temperature=0.0)
                     if enable_web_search
@@ -248,45 +350,6 @@ class SpringTemplateBot2026(ForecastBot):
             "researcher": deterministic_llm,
             "parser": deterministic_llm,
         }
-
-    def _switch_to_fallback_model(self) -> bool:
-        """
-        Switch from free model to paid fallback model.
-        Returns True if switch was successful, False if no fallback available.
-        """
-        if self._using_fallback_model:
-            return False  # Already using fallback
-
-        fallback_model = os.getenv("BOT_FALLBACK_MODEL", "").strip()
-        if not fallback_model:
-            # Auto-detect fallback: remove :free suffix
-            current_default = self.get_llm("default")
-            if isinstance(current_default, GeneralLlm):
-                current_model = current_default.model
-                if ":free" in current_model:
-                    fallback_model = current_model.replace(":free", "")
-                else:
-                    return False
-            else:
-                return False
-
-        logger.warning(
-            f"Switching to fallback model: {fallback_model} (due to rate limit on free model)"
-        )
-
-        # Enable reasoning for fallback model too
-        enable_reasoning = _env_bool("BOT_ENABLE_REASONING", "gpt-oss" in fallback_model.lower())
-        extra_kwargs: dict = {}
-        if enable_reasoning and "openrouter/" in fallback_model.lower():
-            extra_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
-
-        # Update llms config
-        self.llms["default"] = GeneralLlm(model=fallback_model, temperature=0.3, timeout=120, **extra_kwargs)
-        self.llms["summarizer"] = GeneralLlm(model=fallback_model, temperature=0.0, timeout=120, **extra_kwargs)
-        self.llms["parser"] = GeneralLlm(model=fallback_model, temperature=0.0, timeout=120, **extra_kwargs)
-
-        self._using_fallback_model = True
-        return True
 
     ################################# CONCURRENCY ###################################
 
@@ -335,30 +398,6 @@ class SpringTemplateBot2026(ForecastBot):
                     )
                 except BaseException as e:
                     error_str = str(e).lower()
-                    is_rate_limit = (
-                        "free-models-per-day" in error_str
-                        or "rate_limit" in error_str
-                        or "rate limit" in error_str
-                        or "quota" in error_str
-                    )
-
-                    # Try to switch to fallback model and retry
-                    if is_rate_limit and self._switch_to_fallback_model():
-                        logger.info(f"Retrying question with fallback model: {question.page_url}")
-                        try:
-                            reports.append(
-                                await self._run_individual_question_with_error_propagation(
-                                    question
-                                )
-                            )
-                            continue  # Success with fallback, continue to next question
-                        except BaseException as fallback_e:
-                            if not return_exceptions:
-                                raise
-                            reports.append(fallback_e)
-                            logger.error(f"Fallback model also failed: {fallback_e}")
-                            continue
-
                     if not return_exceptions:
                         raise
                     reports.append(e)
@@ -418,6 +457,7 @@ class SpringTemplateBot2026(ForecastBot):
 
             researcher_model_name = GeneralLlm.to_model_name(researcher)
             researcher_model_name_lower = researcher_model_name.lower()
+            logger.info(f"Researcher strategy/model: {researcher_model_name}")
             uses_web_search = (
                 "search-preview" in researcher_model_name_lower
                 or researcher_model_name_lower.startswith("perplexity/")
@@ -524,6 +564,35 @@ class SpringTemplateBot2026(ForecastBot):
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
+    async def summarize_research(
+        self, question: MetaculusQuestion, research: str
+    ) -> str:
+        if not self.enable_summarize_research:
+            return "Summarize research was disabled for this run"
+
+        try:
+            logger.info(f"Summarizing research for question: {question.page_url}")
+            prompt = clean_indents(
+                f"""
+                Please summarize the following research in 1-2 paragraphs. The research tries to help answer the following question:
+                {question.question_text}
+
+                Only summarize the research. Do not answer the question. Just say what the research says w/o any opinions added.
+                At the end mention what websites/sources were used (and copy links verbatim if possible)
+
+                The research is:
+                {research}
+                """
+            )
+            return await self._invoke_llm_with_transient_fallback(
+                "summarizer", prompt, context=f"Summarize research ({question.page_url})"
+            )
+        except Exception as e:
+            if self.use_research_summary_to_forecast:
+                raise e
+            logger.warning(f"Could not summarize research. {e}")
+            return f"{e.__class__.__name__} exception while summarizing research"
+
     ##################################### BINARY QUESTIONS #####################################
 
     async def _run_forecast_on_binary(
@@ -573,14 +642,35 @@ class SpringTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
+        reasoning = await self._invoke_llm_with_transient_fallback(
+            "default", prompt, context=f"Binary forecast reasoning ({question.page_url})"
         )
+        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        parser_model = self.get_llm("parser", "llm")
+        try:
+            binary_prediction: BinaryPrediction = await structure_output(
+                reasoning,
+                BinaryPrediction,
+                model=parser_model,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+        except BaseException as e:
+            fallback_parser = (
+                self._make_fallback_llm("parser")
+                if self._is_transient_provider_error(e)
+                else None
+            )
+            if fallback_parser is None:
+                raise
+            logger.warning(
+                f"Binary parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
+            )
+            binary_prediction = await structure_output(
+                reasoning,
+                BinaryPrediction,
+                model=fallback_parser,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
         logger.info(
@@ -649,15 +739,39 @@ class SpringTemplateBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
+        reasoning = await self._invoke_llm_with_transient_fallback(
+            "default",
+            prompt,
+            context=f"Multiple choice forecast reasoning ({question.page_url})",
         )
+        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        parser_model = self.get_llm("parser", "llm")
+        try:
+            predicted_option_list: PredictedOptionList = await structure_output(
+                text_to_structure=reasoning,
+                output_type=PredictedOptionList,
+                model=parser_model,
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=parsing_instructions,
+            )
+        except BaseException as e:
+            fallback_parser = (
+                self._make_fallback_llm("parser")
+                if self._is_transient_provider_error(e)
+                else None
+            )
+            if fallback_parser is None:
+                raise
+            logger.warning(
+                f"Multiple choice parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
+            )
+            predicted_option_list = await structure_output(
+                text_to_structure=reasoning,
+                output_type=PredictedOptionList,
+                model=fallback_parser,
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=parsing_instructions,
+            )
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -734,7 +848,9 @@ class SpringTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_llm_with_transient_fallback(
+            "default", prompt, context=f"Numeric forecast reasoning ({question.page_url})"
+        )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -749,13 +865,33 @@ class SpringTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        parser_model = self.get_llm("parser", "llm")
+        try:
+            percentile_list: list[Percentile] = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=parser_model,
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+        except BaseException as e:
+            fallback_parser = (
+                self._make_fallback_llm("parser")
+                if self._is_transient_provider_error(e)
+                else None
+            )
+            if fallback_parser is None:
+                raise
+            logger.warning(
+                f"Numeric parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
+            )
+            percentile_list = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=fallback_parser,
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -830,7 +966,9 @@ class SpringTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_llm_with_transient_fallback(
+            "default", prompt, context=f"Date forecast reasoning ({question.page_url})"
+        )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -841,13 +979,33 @@ class SpringTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+        parser_model = self.get_llm("parser", "llm")
+        try:
+            date_percentile_list: list[DatePercentile] = await structure_output(
+                reasoning,
+                list[DatePercentile],
+                model=parser_model,
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+        except BaseException as e:
+            fallback_parser = (
+                self._make_fallback_llm("parser")
+                if self._is_transient_provider_error(e)
+                else None
+            )
+            if fallback_parser is None:
+                raise
+            logger.warning(
+                f"Date parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
+            )
+            date_percentile_list = await structure_output(
+                reasoning,
+                list[DatePercentile],
+                model=fallback_parser,
+                additional_instructions=parsing_instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
 
         percentile_list = [
             Percentile(
