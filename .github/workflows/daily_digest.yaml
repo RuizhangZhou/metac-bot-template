@@ -9,14 +9,14 @@ on:
         default: "no_research"
         type: string
       default_model:
-        description: "Override default LLM model (Litellm format), e.g. openrouter/openai/gpt-oss-120b:free"
+        description: "Override default LLM model (Litellm format). Leave empty to use KICONNECT_MODEL."
         required: false
-        default: "openrouter/openai/gpt-oss-120b:free"
+        default: ""
         type: string
       parser_model:
-        description: "Override parser LLM model (Litellm format), e.g. openrouter/openai/gpt-oss-120b:free"
+        description: "Override parser LLM model (Litellm format). Leave empty to use KICONNECT_MODEL."
         required: false
-        default: "openrouter/openai/gpt-oss-120b:free"
+        default: ""
         type: string
   # schedule:
   #   - cron: "0 12 * * *" # daily at 20:00 Asia/Shanghai (12:00 UTC)
@@ -61,20 +61,23 @@ jobs:
           DEFAULT_MODEL="${{ github.event.inputs.default_model }}"
           PARSER_MODEL="${{ github.event.inputs.parser_model }}"
           if [ -z "$RESEARCHER" ]; then RESEARCHER="no_research"; fi
-          if [ -z "$DEFAULT_MODEL" ]; then DEFAULT_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
-          if [ -z "$PARSER_MODEL" ]; then PARSER_MODEL="openrouter/openai/gpt-oss-120b:free"; fi
-          poetry run python main.py --mode digest --researcher "$RESEARCHER" --default-model "$DEFAULT_MODEL" --parser-model "$PARSER_MODEL"
+          ARGS=(main.py --mode digest --researcher "$RESEARCHER")
+          if [ -n "$DEFAULT_MODEL" ]; then ARGS+=(--default-model "$DEFAULT_MODEL"); fi
+          if [ -n "$PARSER_MODEL" ]; then ARGS+=(--parser-model "$PARSER_MODEL"); fi
+          poetry run python "${ARGS[@]}"
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           METACULUS_TRACK_TOKEN: ${{ secrets.METACULUS_TRACK_TOKEN }}
           BOT_MAX_TOKENS: "4096"
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
-          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          KICONNECT_API_URL: ${{ secrets.KICONNECT_API_URL }}
+          KICONNECT_API_KEY: ${{ secrets.KICONNECT_API_KEY }}
+          KICONNECT_MODEL: ${{ vars.KICONNECT_MODEL }}
+          KICONNECT_MODEL_FALLBACKS: ${{ vars.KICONNECT_MODEL_FALLBACKS }}
+          BOT_REQUIRE_KICONNECT: "true"
+          BOT_ENABLE_FALLBACK: "true"
+          BOT_FALLBACK_MODEL: "openrouter/openai/gpt-oss-120b:free"
           MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
           MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}

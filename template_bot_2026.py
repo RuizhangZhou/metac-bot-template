@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 import dotenv
 from typing import Literal
+from typing import TypeVar
 
 import requests
 
@@ -45,6 +46,7 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -180,6 +182,93 @@ class SpringTemplateBot2026(ForecastBot):
         return False
 
     @staticmethod
+    def _parse_csv_env(name: str) -> list[str]:
+        raw = os.getenv(name, "")
+        if not raw:
+            return []
+        parts = [part.strip() for part in re.split(r"[,\n]+", raw) if part.strip()]
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for part in parts:
+            if part in seen:
+                continue
+            seen.add(part)
+            deduped.append(part)
+        return deduped
+
+    @staticmethod
+    def _normalize_url_for_compare(url: str) -> str:
+        return url.strip().rstrip("/")
+
+    def _is_kiconnect_llm(self, llm: GeneralLlm) -> bool:
+        llm_base_url = str(llm.litellm_kwargs.get("base_url") or "").strip()
+        kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
+        if not llm_base_url or not kiconnect_api_url:
+            return False
+        return self._normalize_url_for_compare(
+            llm_base_url
+        ) == self._normalize_url_for_compare(kiconnect_api_url)
+
+    @staticmethod
+    def _kiconnect_model_name(base_model: str, fallback: str) -> str:
+        fallback = fallback.strip()
+        if not fallback:
+            raise ValueError("Empty fallback model name")
+        if "/" in fallback:
+            return fallback
+        provider = "openai"
+        if "/" in base_model:
+            provider = base_model.split("/", 1)[0] or provider
+        return f"{provider}/{fallback}"
+
+    def _make_kiconnect_fallback_llms_from_llm(
+        self, base_llm: GeneralLlm
+    ) -> list[GeneralLlm]:
+        if not _env_bool("BOT_ENABLE_FALLBACK", True):
+            return []
+
+        if not self._is_kiconnect_llm(base_llm):
+            return []
+
+        fallback_models = self._parse_csv_env("KICONNECT_MODEL_FALLBACKS")
+        if not fallback_models:
+            return []
+
+        base_model = base_llm.model
+        temperature = base_llm.litellm_kwargs.get("temperature", 0.0)
+        timeout = base_llm.litellm_kwargs.get("timeout")
+
+        clone_kwargs: dict = {}
+        for key in ("base_url", "api_key", "api_version", "extra_headers", "extra_body"):
+            if base_llm.litellm_kwargs.get(key) is not None:
+                clone_kwargs[key] = base_llm.litellm_kwargs[key]
+
+        llms: list[GeneralLlm] = []
+        seen_models: set[str] = {base_model}
+        for raw_model in fallback_models:
+            try:
+                model = self._kiconnect_model_name(base_model, raw_model)
+            except Exception:
+                continue
+            if model in seen_models:
+                continue
+            seen_models.add(model)
+            llms.append(
+                GeneralLlm(
+                    model=model,
+                    temperature=temperature,
+                    timeout=timeout,
+                    allowed_tries=base_llm.allowed_tries,
+                    **clone_kwargs,
+                )
+            )
+        return llms
+
+    def _make_kiconnect_fallback_llms(self, purpose: str) -> list[GeneralLlm]:
+        base_llm = self.get_llm(purpose, "llm")
+        return self._make_kiconnect_fallback_llms_from_llm(base_llm)
+
+    @staticmethod
     def _fallback_model_name_for(model_name: str) -> str | None:
         configured = os.getenv("BOT_FALLBACK_MODEL", "").strip()
         if configured:
@@ -203,6 +292,14 @@ class SpringTemplateBot2026(ForecastBot):
         temperature = base_llm.litellm_kwargs.get("temperature", 0.0)
 
         extra_kwargs: dict = {}
+        if base_llm.litellm_kwargs.get("base_url") is not None:
+            fallback_provider = (
+                fallback_model.split("/", 1)[0] if "/" in fallback_model else "openai"
+            )
+            if fallback_provider == "openai":
+                extra_kwargs["base_url"] = base_llm.litellm_kwargs["base_url"]
+                if base_llm.litellm_kwargs.get("api_key") is not None:
+                    extra_kwargs["api_key"] = base_llm.litellm_kwargs["api_key"]
         if base_llm.litellm_kwargs.get("extra_body") is not None:
             extra_kwargs["extra_body"] = base_llm.litellm_kwargs["extra_body"]
 
@@ -223,13 +320,74 @@ class SpringTemplateBot2026(ForecastBot):
         except BaseException as e:
             if not self._is_transient_provider_error(e):
                 raise
-            fallback_llm = self._make_fallback_llm(purpose)
-            if fallback_llm is None:
+            fallback_llms: list[GeneralLlm] = []
+            fallback_llms.extend(self._make_kiconnect_fallback_llms(purpose))
+            configured_fallback = self._make_fallback_llm(purpose)
+            if configured_fallback is not None:
+                fallback_llms.append(configured_fallback)
+            if not fallback_llms:
                 raise
-            logger.warning(
-                f"{context}: base model '{base_llm.model}' failed; retrying once with fallback '{fallback_llm.model}'. Error: {e}"
+
+            last_error: BaseException = e
+            for idx, llm in enumerate(fallback_llms, start=1):
+                logger.warning(
+                    f"{context}: base model '{base_llm.model}' failed; retrying with fallback #{idx} '{llm.model}'. Error: {last_error}"
+                )
+                try:
+                    return await llm.invoke(prompt)
+                except BaseException as fallback_error:
+                    last_error = fallback_error
+                    if not self._is_transient_provider_error(fallback_error):
+                        raise
+            raise last_error
+
+    async def _structure_output_with_transient_fallback(
+        self,
+        *,
+        text_to_structure: str,
+        output_type: type[T],
+        context: str,
+        additional_instructions: str | None = None,
+    ) -> T:
+        parser_model = self.get_llm("parser", "llm")
+        try:
+            return await structure_output(
+                text_to_structure=text_to_structure,
+                output_type=output_type,
+                model=parser_model,
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=additional_instructions,
             )
-            return await fallback_llm.invoke(prompt)
+        except BaseException as e:
+            if not self._is_transient_provider_error(e):
+                raise
+
+            fallback_parsers: list[GeneralLlm] = []
+            fallback_parsers.extend(self._make_kiconnect_fallback_llms("parser"))
+            configured_fallback = self._make_fallback_llm("parser")
+            if configured_fallback is not None:
+                fallback_parsers.append(configured_fallback)
+            if not fallback_parsers:
+                raise
+
+            last_error: BaseException = e
+            for idx, fallback_parser in enumerate(fallback_parsers, start=1):
+                logger.warning(
+                    f"{context}: base parser '{parser_model.model}' failed; retrying with fallback parser #{idx} '{fallback_parser.model}'. Error: {last_error}"
+                )
+                try:
+                    return await structure_output(
+                        text_to_structure=text_to_structure,
+                        output_type=output_type,
+                        model=fallback_parser,
+                        num_validation_samples=self._structure_output_validation_samples,
+                        additional_instructions=additional_instructions,
+                    )
+                except BaseException as fallback_error:
+                    last_error = fallback_error
+                    if not self._is_transient_provider_error(fallback_error):
+                        raise
+            raise last_error
 
     @staticmethod
     def _resolution_criteria_research_guardrails() -> str:
@@ -277,6 +435,29 @@ class SpringTemplateBot2026(ForecastBot):
         single_model = os.getenv("BOT_SINGLE_MODEL", "").strip()
         if not single_model:
             base_model = os.getenv("BOT_BASE_MODEL", "").strip()
+
+            kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
+            kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "").strip()
+            kiconnect_model = os.getenv("KICONNECT_MODEL", "").strip()
+            has_kiconnect = bool(
+                kiconnect_api_url and kiconnect_api_key and kiconnect_model
+            )
+            require_kiconnect = _env_bool("BOT_REQUIRE_KICONNECT", False)
+            if require_kiconnect and not has_kiconnect:
+                raise ValueError(
+                    "BOT_REQUIRE_KICONNECT=true but KICONNECT_API_URL/KICONNECT_API_KEY/KICONNECT_MODEL are not all set."
+                )
+
+            base_llm_kwargs: dict = {}
+            if not base_model and has_kiconnect:
+                # Treat KIconnect as an OpenAI-compatible /chat/completions endpoint.
+                # Example base_url: https://.../api/v1
+                base_model = f"openai/{kiconnect_model}"
+                base_llm_kwargs = {
+                    "base_url": kiconnect_api_url,
+                    "api_key": kiconnect_api_key,
+                }
+
             if not base_model:
                 if os.getenv("OPENROUTER_API_KEY"):
                     base_model = "openrouter/openai/gpt-oss-120b:free"
@@ -312,33 +493,47 @@ class SpringTemplateBot2026(ForecastBot):
             if enable_reasoning and "openrouter/" in base_model.lower():
                 extra_kwargs["extra_body"] = {"reasoning": {"enabled": True}}
 
+            # If using KIconnect, reuse base_url/api_key for all non-search LLM calls.
+            merged_base_kwargs = {**base_llm_kwargs, **extra_kwargs}
+
+            researcher: str | GeneralLlm
+            if enable_web_search and os.getenv("EXA_API_KEY"):
+                # Prefer Exa + SmartSearcher (no paid "search-preview" models required).
+                researcher = (
+                    "smart-searcher/kiconnect"
+                    if has_kiconnect
+                    else "smart-searcher/openrouter/openai/gpt-oss-120b:free"
+                )
+            else:
+                researcher = (
+                    GeneralLlm(model=search_model, temperature=0.0)
+                    if enable_web_search
+                    else "no_research"
+                )
+
             return {
                 "default": GeneralLlm(
                     model=base_model,
                     temperature=0.3,
                     timeout=base_timeout,
                     allowed_tries=base_allowed_tries,
-                    **extra_kwargs,
+                    **merged_base_kwargs,
                 ),
                 "summarizer": GeneralLlm(
                     model=base_model,
                     temperature=0.0,
                     timeout=base_timeout,
                     allowed_tries=base_allowed_tries,
-                    **extra_kwargs,
+                    **merged_base_kwargs,
                 ),
                 "parser": GeneralLlm(
                     model=base_model,
                     temperature=0.0,
                     timeout=base_timeout,
                     allowed_tries=base_allowed_tries,
-                    **extra_kwargs,
+                    **merged_base_kwargs,
                 ),
-                "researcher": (
-                    GeneralLlm(model=search_model, temperature=0.0)
-                    if enable_web_search
-                    else "no_research"
-                ),
+                "researcher": researcher,
             }
 
         # Single-model mode (debug/experiments).
@@ -507,7 +702,9 @@ class SpringTemplateBot2026(ForecastBot):
             )
 
             if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
+                research = await self._invoke_llm_with_transient_fallback(
+                    "researcher", prompt, context=f"Research ({question.page_url})"
+                )
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -531,6 +728,28 @@ class SpringTemplateBot2026(ForecastBot):
                     research = ""
             elif researcher.startswith("smart-searcher"):
                 model_name = researcher.removeprefix("smart-searcher/")
+                model_name_lower = model_name.strip().lower()
+                if model_name_lower == "kiconnect" or model_name_lower.startswith(
+                    "kiconnect/"
+                ):
+                    kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
+                    kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "").strip()
+                    kiconnect_model = os.getenv("KICONNECT_MODEL", "").strip()
+                    if not (kiconnect_api_url and kiconnect_api_key and kiconnect_model):
+                        raise ValueError(
+                            "smart-searcher/kiconnect requested but KICONNECT_API_URL/KICONNECT_API_KEY/KICONNECT_MODEL are not all set."
+                        )
+                    override_model = None
+                    if "/" in model_name:
+                        _, override_model = model_name.split("/", 1)
+                        override_model = override_model.strip() or None
+                    search_llm = GeneralLlm(
+                        model=f"openai/{override_model or kiconnect_model}",
+                        temperature=0,
+                        base_url=kiconnect_api_url,
+                        api_key=kiconnect_api_key,
+                    )
+                    model_name = search_llm
                 try:
                     num_searches_to_run = int(
                         os.getenv("SMART_SEARCHER_NUM_SEARCHES", "2")
@@ -549,18 +768,62 @@ class SpringTemplateBot2026(ForecastBot):
                     .lower()
                     in {"1", "true", "yes", "y"}
                 )
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=max(1, num_searches_to_run),
-                    num_sites_per_search=max(1, num_sites_per_search),
-                    use_advanced_filters=use_advanced_filters,
-                )
-                research = await searcher.invoke(prompt)
+                candidate_models: list[str | GeneralLlm] = [model_name]
+                if isinstance(model_name, GeneralLlm):
+                    candidate_models.extend(
+                        self._make_kiconnect_fallback_llms_from_llm(model_name)
+                    )
+                    fallback_search_model_name = self._fallback_model_name_for(
+                        model_name.model
+                    )
+                    if (
+                        fallback_search_model_name
+                        and fallback_search_model_name != model_name.model
+                    ):
+                        candidate_models.append(
+                            GeneralLlm(model=fallback_search_model_name, temperature=0)
+                        )
+
+                seen: set[str] = set()
+                deduped_models: list[str | GeneralLlm] = []
+                for candidate in candidate_models:
+                    candidate_name = GeneralLlm.to_model_name(candidate)
+                    if candidate_name in seen:
+                        continue
+                    seen.add(candidate_name)
+                    deduped_models.append(candidate)
+
+                last_error: BaseException | None = None
+                for idx, candidate in enumerate(deduped_models, start=1):
+                    searcher = SmartSearcher(
+                        model=candidate,
+                        temperature=0,
+                        num_searches_to_run=max(1, num_searches_to_run),
+                        num_sites_per_search=max(1, num_sites_per_search),
+                        use_advanced_filters=use_advanced_filters,
+                    )
+                    try:
+                        research = await searcher.invoke(prompt)
+                        break
+                    except BaseException as e:
+                        last_error = e
+                        if not self._is_transient_provider_error(e):
+                            raise
+                        if idx >= len(deduped_models):
+                            raise
+                        logger.warning(
+                            f"SmartSearcher ({question.page_url}): search model '{GeneralLlm.to_model_name(candidate)}' failed; retrying with fallback search model #{idx} '{GeneralLlm.to_model_name(deduped_models[idx])}'. Error: {e}"
+                        )
+                else:
+                    raise last_error if last_error is not None else RuntimeError(
+                        "SmartSearcher failed without an exception"
+                    )
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+                research = await self._invoke_llm_with_transient_fallback(
+                    "researcher", prompt, context=f"Research ({question.page_url})"
+                )
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -646,31 +909,13 @@ class SpringTemplateBot2026(ForecastBot):
             "default", prompt, context=f"Binary forecast reasoning ({question.page_url})"
         )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parser_model = self.get_llm("parser", "llm")
-        try:
-            binary_prediction: BinaryPrediction = await structure_output(
-                reasoning,
-                BinaryPrediction,
-                model=parser_model,
-                num_validation_samples=self._structure_output_validation_samples,
+        binary_prediction: BinaryPrediction = (
+            await self._structure_output_with_transient_fallback(
+                text_to_structure=reasoning,
+                output_type=BinaryPrediction,
+                context=f"Binary parse ({question.page_url})",
             )
-        except BaseException as e:
-            fallback_parser = (
-                self._make_fallback_llm("parser")
-                if self._is_transient_provider_error(e)
-                else None
-            )
-            if fallback_parser is None:
-                raise
-            logger.warning(
-                f"Binary parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
-            )
-            binary_prediction = await structure_output(
-                reasoning,
-                BinaryPrediction,
-                model=fallback_parser,
-                num_validation_samples=self._structure_output_validation_samples,
-            )
+        )
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
         logger.info(
@@ -745,33 +990,14 @@ class SpringTemplateBot2026(ForecastBot):
             context=f"Multiple choice forecast reasoning ({question.page_url})",
         )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parser_model = self.get_llm("parser", "llm")
-        try:
-            predicted_option_list: PredictedOptionList = await structure_output(
+        predicted_option_list: PredictedOptionList = (
+            await self._structure_output_with_transient_fallback(
                 text_to_structure=reasoning,
                 output_type=PredictedOptionList,
-                model=parser_model,
-                num_validation_samples=self._structure_output_validation_samples,
+                context=f"Multiple choice parse ({question.page_url})",
                 additional_instructions=parsing_instructions,
             )
-        except BaseException as e:
-            fallback_parser = (
-                self._make_fallback_llm("parser")
-                if self._is_transient_provider_error(e)
-                else None
-            )
-            if fallback_parser is None:
-                raise
-            logger.warning(
-                f"Multiple choice parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
-            )
-            predicted_option_list = await structure_output(
-                text_to_structure=reasoning,
-                output_type=PredictedOptionList,
-                model=fallback_parser,
-                num_validation_samples=self._structure_output_validation_samples,
-                additional_instructions=parsing_instructions,
-            )
+        )
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -865,33 +1091,14 @@ class SpringTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        parser_model = self.get_llm("parser", "llm")
-        try:
-            percentile_list: list[Percentile] = await structure_output(
-                reasoning,
-                list[Percentile],
-                model=parser_model,
+        percentile_list: list[Percentile] = (
+            await self._structure_output_with_transient_fallback(
+                text_to_structure=reasoning,
+                output_type=list[Percentile],
+                context=f"Numeric parse ({question.page_url})",
                 additional_instructions=parsing_instructions,
-                num_validation_samples=self._structure_output_validation_samples,
             )
-        except BaseException as e:
-            fallback_parser = (
-                self._make_fallback_llm("parser")
-                if self._is_transient_provider_error(e)
-                else None
-            )
-            if fallback_parser is None:
-                raise
-            logger.warning(
-                f"Numeric parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
-            )
-            percentile_list = await structure_output(
-                reasoning,
-                list[Percentile],
-                model=fallback_parser,
-                additional_instructions=parsing_instructions,
-                num_validation_samples=self._structure_output_validation_samples,
-            )
+        )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -979,33 +1186,14 @@ class SpringTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        parser_model = self.get_llm("parser", "llm")
-        try:
-            date_percentile_list: list[DatePercentile] = await structure_output(
-                reasoning,
-                list[DatePercentile],
-                model=parser_model,
+        date_percentile_list: list[DatePercentile] = (
+            await self._structure_output_with_transient_fallback(
+                text_to_structure=reasoning,
+                output_type=list[DatePercentile],
+                context=f"Date parse ({question.page_url})",
                 additional_instructions=parsing_instructions,
-                num_validation_samples=self._structure_output_validation_samples,
             )
-        except BaseException as e:
-            fallback_parser = (
-                self._make_fallback_llm("parser")
-                if self._is_transient_provider_error(e)
-                else None
-            )
-            if fallback_parser is None:
-                raise
-            logger.warning(
-                f"Date parse ({question.page_url}): base parser '{parser_model.model}' failed; retrying with fallback '{fallback_parser.model}'. Error: {e}"
-            )
-            date_percentile_list = await structure_output(
-                reasoning,
-                list[DatePercentile],
-                model=fallback_parser,
-                additional_instructions=parsing_instructions,
-                num_validation_samples=self._structure_output_validation_samples,
-            )
+        )
 
         percentile_list = [
             Percentile(

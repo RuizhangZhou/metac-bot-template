@@ -125,6 +125,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 if __name__ == "__main__":
     dotenv.load_dotenv()
+    try:
+        openclaw_env_path = Path.home() / ".openclaw" / ".env"
+        if openclaw_env_path.exists():
+            dotenv.load_dotenv(openclaw_env_path, override=False)
+    except Exception:
+        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
