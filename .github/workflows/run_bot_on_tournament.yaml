@@ -1,12 +1,12 @@
-name: Forecast on Spring 2026 AIB (bot submission)
+name: Forecast on Tournaments (AIB + minibench)
 
 on:
   workflow_dispatch:
     inputs:
       tournament:
-        description: "Tournament slug or URL (default: spring-aib-2026)"
+        description: "Single tournament to run (leave empty for all: AIB, minibench, active minibench-YYYY-MM-DD)"
         required: false
-        default: "spring-aib-2026"
+        default: ""
         type: string
       researcher:
         description: "Research strategy/model (e.g. no_research, smart-searcher/kiconnect)"
@@ -75,7 +75,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          TOURNAMENT="${{ github.event.inputs.tournament }}"
+          MANUAL_TOURNAMENT="${{ github.event.inputs.tournament }}"
           RESEARCHER="${{ github.event.inputs.researcher }}"
           DEFAULT_MODEL="${{ github.event.inputs.default_model }}"
           PARSER_MODEL="${{ github.event.inputs.parser_model }}"
@@ -83,7 +83,6 @@ jobs:
           SMART_SEARCHER_NUM_SITES_PER_SEARCH="${{ github.event.inputs.smart_searcher_num_sites_per_search }}"
           SMART_SEARCHER_USE_ADVANCED_FILTERS="${{ github.event.inputs.smart_searcher_use_advanced_filters }}"
 
-          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${AIB_TOURNAMENT:-spring-aib-2026}"; fi
           if [ -z "$RESEARCHER" ]; then RESEARCHER="smart-searcher/kiconnect"; fi
           if [ -z "$SMART_SEARCHER_NUM_SEARCHES" ]; then SMART_SEARCHER_NUM_SEARCHES="1"; fi
           if [ -z "$SMART_SEARCHER_NUM_SITES_PER_SEARCH" ]; then SMART_SEARCHER_NUM_SITES_PER_SEARCH="5"; fi
@@ -93,10 +92,42 @@ jobs:
           export SMART_SEARCHER_NUM_SITES_PER_SEARCH
           export SMART_SEARCHER_USE_ADVANCED_FILTERS
 
-          ARGS=(main.py --mode tournament --tournament "$TOURNAMENT" --researcher "$RESEARCHER" --submit)
-          if [ -n "$DEFAULT_MODEL" ]; then ARGS+=(--default-model "$DEFAULT_MODEL"); fi
-          if [ -n "$PARSER_MODEL" ]; then ARGS+=(--parser-model "$PARSER_MODEL"); fi
-          poetry run python "${ARGS[@]}"
+          # Build tournament list
+          # If manual input provided, only run that tournament
+          if [ -n "$MANUAL_TOURNAMENT" ]; then
+            TOURNAMENTS=("$MANUAL_TOURNAMENT")
+          else
+            # Priority order: spring-aib-2026, minibench, then dynamic minibench dates
+            TOURNAMENTS=("${AIB_TOURNAMENT:-spring-aib-2026}" "minibench")
+
+            # Calculate active minibench tournaments based on 2026-01-19 baseline
+            # Each minibench starts every 2 weeks (Monday) and lasts 30 days
+            BASE_DATE=$(date -d "2026-01-19" +%s)
+            TODAY=$(date +%s)
+            INTERVAL=$((14 * 86400))  # 14 days in seconds
+            DURATION=$((30 * 86400))  # 30 days in seconds
+
+            current=$BASE_DATE
+            while [ $current -le $TODAY ]; do
+              end_date=$((current + DURATION))
+              if [ $end_date -ge $TODAY ]; then
+                date_str=$(date -d "@$current" +%Y-%m-%d)
+                TOURNAMENTS+=("minibench-$date_str")
+              fi
+              current=$((current + INTERVAL))
+            done
+          fi
+
+          echo "Tournaments to process: ${TOURNAMENTS[*]}"
+
+          # Run bot for each tournament
+          for TOURNAMENT in "${TOURNAMENTS[@]}"; do
+            echo "=== Processing tournament: $TOURNAMENT ==="
+            ARGS=(main.py --mode tournament --tournament "$TOURNAMENT" --researcher "$RESEARCHER" --submit)
+            if [ -n "$DEFAULT_MODEL" ]; then ARGS+=(--default-model "$DEFAULT_MODEL"); fi
+            if [ -n "$PARSER_MODEL" ]; then ARGS+=(--parser-model "$PARSER_MODEL"); fi
+            poetry run python "${ARGS[@]}" || echo "Warning: Failed to process $TOURNAMENT, continuing..."
+          done
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
