@@ -130,6 +130,7 @@ celerybeat.pid
 .env
 .state/
 reports/
+logs/
 .venv
 env/
 venv/
