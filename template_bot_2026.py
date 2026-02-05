@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import json
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -74,6 +75,20 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     logger.warning(f"Ignoring invalid boolean for {name}: {raw!r}")
     return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Ignoring invalid float for {name}: {raw!r}")
+        return default
 
 
 class SpringTemplateBot2026(ForecastBot):
@@ -180,6 +195,356 @@ class SpringTemplateBot2026(ForecastBot):
         if '"code":429' in error_text or " 429" in error_text:
             return True
         return False
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        p = min(1 - 1e-12, max(1e-12, p))
+        return math.log(p / (1.0 - p))
+
+    _URL_REGEX = re.compile(r"https?://\\S+", re.IGNORECASE)
+    _NUMBER_REGEX = re.compile(r"\\b\\d+(?:[\\.,]\\d+)?\\b")
+    _HEDGE_REGEX = re.compile(
+        r"\\b(uncertain|unknown|unclear|hard to|difficult|maybe|might|could|speculat|not sure|no clear)\\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _days_until_known(question: MetaculusQuestion) -> float | None:
+        now = datetime.now(timezone.utc)
+        target = (
+            getattr(question, "scheduled_resolution_time", None)
+            or getattr(question, "close_time", None)
+            or getattr(question, "actual_resolution_time", None)
+        )
+        if not isinstance(target, datetime):
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        delta = (target - now).total_seconds() / 86400.0
+        return max(0.0, float(delta))
+
+    def _estimate_forecast_confidence(
+        self,
+        *,
+        question: MetaculusQuestion,
+        research: str,
+        reasoning: str,
+    ) -> float:
+        """
+        Heuristic confidence estimate in [0, 1].
+
+        This is intentionally simple and deterministic (no extra LLM calls).
+        It's used only to apply mild, scoring-friendly shrinkage.
+        """
+
+        research_text = (research or "").strip()
+        reasoning_text = (reasoning or "").strip()
+
+        confidence = 0.55
+        if not research_text:
+            confidence -= 0.20
+        else:
+            confidence += 0.08
+
+        url_count = len(self._URL_REGEX.findall(research_text))
+        confidence += 0.04 * min(5, url_count)
+
+        number_count = len(self._NUMBER_REGEX.findall(research_text))
+        confidence += 0.01 * min(20, number_count)
+
+        hedge_count = len(self._HEDGE_REGEX.findall(research_text + "\n" + reasoning_text))
+        confidence -= 0.03 * min(10, hedge_count)
+
+        days_until_known = self._days_until_known(question)
+        if days_until_known is not None:
+            if days_until_known <= 7:
+                confidence += 0.08
+            elif days_until_known <= 30:
+                confidence += 0.04
+            elif days_until_known >= 365:
+                confidence -= 0.10
+            elif days_until_known >= 180:
+                confidence -= 0.06
+            elif days_until_known >= 90:
+                confidence -= 0.03
+
+        return float(min(0.90, max(0.15, confidence)))
+
+    @staticmethod
+    def _clamp01(x: float, *, lo: float, hi: float) -> float:
+        return float(min(hi, max(lo, x)))
+
+    def _calibrate_binary_probability(
+        self,
+        *,
+        question: BinaryQuestion,
+        p: float,
+        research: str,
+        reasoning: str,
+        context: str,
+    ) -> float:
+        """
+        Automatic post-processing for binary forecasts.
+
+        - Shrinks away from overconfident extremes (log score is harsh near 0/1).
+        - If community prediction is available, shrink deviations toward it unless we have high confidence.
+
+        No .env knobs required: defaults are hardcoded + depend on a simple confidence heuristic.
+        """
+
+        p = self._clamp01(float(p), lo=1e-6, hi=1 - 1e-6)
+        cp = getattr(question, "community_prediction_at_access_time", None)
+        if cp is None:
+            cp = 0.5
+        cp = self._clamp01(float(cp), lo=1e-6, hi=1 - 1e-6)
+
+        confidence = self._estimate_forecast_confidence(
+            question=question, research=research, reasoning=reasoning
+        )
+        days_until_known = self._days_until_known(question)
+
+        trust = 0.35 + 0.65 * confidence  # [~0.45, ~0.94]
+        if days_until_known is not None:
+            if days_until_known <= 7:
+                trust += 0.05
+            elif days_until_known >= 365:
+                trust -= 0.10
+            elif days_until_known >= 180:
+                trust -= 0.06
+            elif days_until_known >= 90:
+                trust -= 0.03
+        trust = float(min(0.97, max(0.25, trust)))
+
+        cp_logit = self._logit(cp)
+        p_logit = self._logit(p)
+        calibrated_logit = cp_logit + trust * (p_logit - cp_logit)
+        calibrated_p = self._sigmoid(calibrated_logit)
+
+        # Dynamic clamp: farther from 0/1 when uncertain or long-horizon.
+        min_p = 0.01 + 0.04 * (1.0 - confidence)
+        if days_until_known is not None and days_until_known >= 180:
+            min_p += 0.01
+        if days_until_known is not None and days_until_known >= 365:
+            min_p += 0.01
+        min_p = float(min(0.08, max(0.01, min_p)))
+        max_p = 1.0 - min_p
+
+        calibrated_p = self._clamp01(calibrated_p, lo=min_p, hi=max_p)
+        logger.info(
+            f"{context}: calibrated binary p={p:.4f} -> {calibrated_p:.4f} (cp={cp:.4f}, conf={confidence:.2f}, trust={trust:.2f})."
+        )
+        return calibrated_p
+
+    @staticmethod
+    def _value_at_percentile(
+        percentiles: list[Percentile], target: float
+    ) -> float | None:
+        if not percentiles:
+            return None
+        target = float(target)
+        if target <= percentiles[0].percentile:
+            return float(percentiles[0].value)
+        if target >= percentiles[-1].percentile:
+            return float(percentiles[-1].value)
+
+        for i in range(len(percentiles) - 1):
+            left = percentiles[i]
+            right = percentiles[i + 1]
+            if left.percentile <= target <= right.percentile:
+                if abs(right.percentile - left.percentile) < 1e-12:
+                    return float(left.value)
+                t = (target - left.percentile) / (right.percentile - left.percentile)
+                return float(left.value + t * (right.value - left.value))
+        return float(percentiles[-1].value)
+
+    def _calibrate_numeric_percentiles(
+        self,
+        *,
+        question: NumericQuestion | DateQuestion,
+        percentiles: list[Percentile],
+        research: str,
+        reasoning: str,
+        context: str,
+    ) -> list[Percentile]:
+        """
+        Automatic post-processing for numeric/date distributions.
+
+        Goal: avoid being *needlessly* wide (too low density everywhere) or *needlessly*
+        narrow (tail risk / severe penalties). If community aggregates are available, we
+        shrink our distribution toward the community unless we have high confidence.
+        """
+
+        if not percentiles:
+            return percentiles
+
+        # Skip log-scaled questions for now to avoid accidental invalid transforms.
+        if getattr(question, "zero_point", None) is not None:
+            return percentiles
+
+        lower_bound = getattr(question, "lower_bound", 0.0)
+        upper_bound = getattr(question, "upper_bound", 0.0)
+        if isinstance(lower_bound, datetime):
+            lower = float(lower_bound.timestamp())
+        else:
+            lower = float(lower_bound)
+        if isinstance(upper_bound, datetime):
+            upper = float(upper_bound.timestamp())
+        else:
+            upper = float(upper_bound)
+        total_range = upper - lower
+        if total_range <= 0:
+            return percentiles
+
+        confidence = self._estimate_forecast_confidence(
+            question=question, research=research, reasoning=reasoning
+        )
+        days_until_known = self._days_until_known(question)
+
+        percentiles = sorted(percentiles, key=lambda p: float(p.percentile))
+
+        # If community aggregate exists, shrink toward it by trust weight.
+        community_cdf = self._get_community_cdf_percentiles(question)
+        if community_cdf:
+            trust = 0.35 + 0.65 * confidence
+            if days_until_known is not None and days_until_known >= 180:
+                trust -= 0.05
+            trust = float(min(0.95, max(0.20, trust)))
+
+            updated_against_community: list[Percentile] = []
+            for p in percentiles:
+                cp_value = self._value_at_percentile(community_cdf, float(p.percentile))
+                if cp_value is None:
+                    updated_against_community.append(p)
+                    continue
+                updated_against_community.append(
+                    Percentile(
+                        percentile=float(p.percentile),
+                        value=float(cp_value + trust * (p.value - cp_value)),
+                    )
+                )
+            percentiles = updated_against_community
+            logger.info(
+                f"{context}: shrunk numeric distribution toward community (conf={confidence:.2f}, trust={trust:.2f})."
+            )
+
+        median = self._value_at_percentile(percentiles, 0.5)
+        if median is None:
+            return percentiles
+
+        v10 = self._value_at_percentile(percentiles, 0.1)
+        v90 = self._value_at_percentile(percentiles, 0.9)
+        if v10 is None or v90 is None:
+            return percentiles
+        raw_width = float(v90 - v10)
+        if raw_width <= 0:
+            return percentiles
+
+        # Automatically keep p90-p10 within a reasonable fraction of the full range.
+        min_width_frac = 0.04 + 0.08 * (1.0 - confidence)
+        max_width_frac = 0.55 + 0.25 * (1.0 - confidence)
+        if days_until_known is not None:
+            if days_until_known <= 30:
+                min_width_frac *= 0.85
+                max_width_frac *= 0.90
+            elif days_until_known >= 180:
+                min_width_frac *= 1.15
+                max_width_frac *= 1.10
+        min_width_frac = float(min(0.20, max(0.02, min_width_frac)))
+        max_width_frac = float(min(0.85, max(min_width_frac + 0.05, max_width_frac)))
+
+        multiplier = 1.0
+        width_after = raw_width * multiplier
+
+        max_width = max_width_frac * total_range
+        if max_width > 0 and width_after > max_width:
+            multiplier *= max_width / width_after
+            width_after = raw_width * multiplier
+            logger.info(
+                f"{context}: narrowing numeric spread to cap p90-p10 <= {max_width_frac:.3f} of range."
+            )
+
+        min_width = min_width_frac * total_range
+        if min_width > 0 and width_after < min_width:
+            multiplier *= min_width / width_after
+            width_after = raw_width * multiplier
+            logger.info(
+                f"{context}: widening numeric spread to floor p90-p10 >= {min_width_frac:.3f} of range."
+            )
+
+        if abs(multiplier - 1.0) < 1e-6:
+            return percentiles
+
+        # Guard against pathological collapse.
+        multiplier = max(0.05, min(5.0, multiplier))
+
+        updated: list[Percentile] = []
+        for p in percentiles:
+            updated.append(
+                Percentile(
+                    percentile=float(p.percentile),
+                    value=float(median + (p.value - median) * multiplier),
+                )
+            )
+
+        # Ensure strictly increasing values (floating error / extreme multipliers).
+        epsilon = total_range * 1e-9 or 1e-9
+        last_value = updated[0].value
+        for i in range(1, len(updated)):
+            if updated[i].value <= last_value:
+                updated[i] = Percentile(
+                    percentile=updated[i].percentile,
+                    value=last_value + epsilon,
+                )
+            last_value = updated[i].value
+
+        return updated
+
+    @staticmethod
+    def _get_community_cdf_percentiles(
+        question: NumericQuestion | DateQuestion,
+    ) -> list[Percentile] | None:
+        """
+        Best-effort extraction of the latest community aggregate CDF from the question API JSON.
+        Returns a list of Percentile(value=x, percentile=cdf(x)) suitable for _value_at_percentile().
+        """
+        try:
+            api_json = getattr(question, "api_json", None) or {}
+            scaling = api_json["question"]["scaling"]
+            continuous_range = scaling["continuous_range"]
+            aggregations = api_json["question"]["aggregations"]
+
+            latest = None
+            for key in ("recency_weighted", "unweighted"):
+                try:
+                    latest = aggregations[key]["latest"]
+                    break
+                except Exception:
+                    continue
+            if latest is None:
+                return None
+
+            forecast_values = latest.get("forecast_values")
+            if not isinstance(continuous_range, list) or not isinstance(
+                forecast_values, list
+            ):
+                return None
+            if len(continuous_range) != len(forecast_values) or len(continuous_range) < 2:
+                return None
+
+            result: list[Percentile] = []
+            for x, cdf in zip(continuous_range, forecast_values):
+                result.append(Percentile(value=float(x), percentile=float(cdf)))
+            return result
+        except Exception:
+            return None
 
     @staticmethod
     def _parse_csv_env(name: str) -> list[str]:
@@ -898,12 +1263,14 @@ class SpringTemplateBot2026(ForecastBot):
             """
         )
 
-        return await self._binary_prompt_to_forecast(question, prompt)
+        return await self._binary_prompt_to_forecast(question, prompt, research=research)
 
     async def _binary_prompt_to_forecast(
         self,
         question: BinaryQuestion,
         prompt: str,
+        *,
+        research: str,
     ) -> ReasonedPrediction[float]:
         reasoning = await self._invoke_llm_with_transient_fallback(
             "default", prompt, context=f"Binary forecast reasoning ({question.page_url})"
@@ -917,6 +1284,13 @@ class SpringTemplateBot2026(ForecastBot):
             )
         )
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        decimal_pred = self._calibrate_binary_probability(
+            question=question,
+            p=decimal_pred,
+            research=research,
+            reasoning=reasoning,
+            context=f"Binary calibration ({question.page_url})",
+        )
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -1054,7 +1428,7 @@ class SpringTemplateBot2026(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set well-calibrated 90/10 confidence intervals (avoid being artificially wide “just to be safe”).
 
             The last thing you write is your final answer as:
             "
@@ -1067,12 +1441,14 @@ class SpringTemplateBot2026(ForecastBot):
             "
             """
         )
-        return await self._numeric_prompt_to_forecast(question, prompt)
+        return await self._numeric_prompt_to_forecast(question, prompt, research=research)
 
     async def _numeric_prompt_to_forecast(
         self,
         question: NumericQuestion,
         prompt: str,
+        *,
+        research: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._invoke_llm_with_transient_fallback(
             "default", prompt, context=f"Numeric forecast reasoning ({question.page_url})"
@@ -1098,6 +1474,13 @@ class SpringTemplateBot2026(ForecastBot):
                 context=f"Numeric parse ({question.page_url})",
                 additional_instructions=parsing_instructions,
             )
+        )
+        percentile_list = self._calibrate_numeric_percentiles(
+            question=question,
+            percentiles=percentile_list,
+            research=research,
+            reasoning=reasoning,
+            context=f"Numeric calibration ({question.page_url})",
         )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
@@ -1152,7 +1535,7 @@ class SpringTemplateBot2026(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set well-calibrated 90/10 confidence intervals (avoid being artificially wide “just to be safe”).
 
             The last thing you write is your final answer as:
             "
@@ -1165,13 +1548,15 @@ class SpringTemplateBot2026(ForecastBot):
             "
             """
         )
-        forecast = await self._date_prompt_to_forecast(question, prompt)
+        forecast = await self._date_prompt_to_forecast(question, prompt, research=research)
         return forecast
 
     async def _date_prompt_to_forecast(
         self,
         question: DateQuestion,
         prompt: str,
+        *,
+        research: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._invoke_llm_with_transient_fallback(
             "default", prompt, context=f"Date forecast reasoning ({question.page_url})"
@@ -1202,6 +1587,13 @@ class SpringTemplateBot2026(ForecastBot):
             )
             for percentile in date_percentile_list
         ]
+        percentile_list = self._calibrate_numeric_percentiles(
+            question=question,
+            percentiles=percentile_list,
+            research=research,
+            reasoning=reasoning,
+            context=f"Date calibration ({question.page_url})",
+        )
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
