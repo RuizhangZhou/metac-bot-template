@@ -10,6 +10,9 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -209,10 +212,10 @@ class SpringTemplateBot2026(ForecastBot):
         p = min(1 - 1e-12, max(1e-12, p))
         return math.log(p / (1.0 - p))
 
-    _URL_REGEX = re.compile(r"https?://\\S+", re.IGNORECASE)
-    _NUMBER_REGEX = re.compile(r"\\b\\d+(?:[\\.,]\\d+)?\\b")
+    _URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
+    _NUMBER_REGEX = re.compile(r"\b\d+(?:[.,]\d+)?\b")
     _HEDGE_REGEX = re.compile(
-        r"\\b(uncertain|unknown|unclear|hard to|difficult|maybe|might|could|speculat|not sure|no clear)\\b",
+        r"\b(uncertain|unknown|unclear|hard to|difficult|maybe|might|could|speculat|not sure|no clear)\b",
         re.IGNORECASE,
     )
 
@@ -760,6 +763,7 @@ class SpringTemplateBot2026(ForecastBot):
             """
             Priority: Interpret the Resolution Criteria and Fine Print literally (they are the contract).
             First, restate what would count as each possible resolution per the criteria, and list any ambiguous terms.
+            If the question provides specific source links or named datasets (often in Background Info / Resolution Criteria), prioritize those over generic search results.
             When you cite outside information, explicitly connect it back to the criteria.
             """
         )
@@ -1010,10 +1014,253 @@ class SpringTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
 
+    @staticmethod
+    def _infer_ticker_symbol(question: MetaculusQuestion) -> str | None:
+        """
+        Best-effort ticker extraction for finance-style group questions.
+
+        Group subquestions typically store the ticker in `group_question_option`.
+        """
+
+        group_option = getattr(question, "group_question_option", None)
+        if isinstance(group_option, str):
+            candidate = group_option.strip().upper()
+            if 1 <= len(candidate) <= 10 and candidate.replace(".", "").isalnum():
+                return candidate
+
+        text = (getattr(question, "question_text", None) or "").strip()
+        matches = re.findall(r"\(([A-Za-z0-9.]{1,10})\)\s*$", text)
+        if matches:
+            return matches[-1].upper()
+        return None
+
+    @staticmethod
+    def _looks_like_eps_question(question: MetaculusQuestion) -> bool:
+        haystack = "\n".join(
+            [
+                (getattr(question, "question_text", None) or ""),
+                (getattr(question, "resolution_criteria", None) or ""),
+                (getattr(question, "background_info", None) or ""),
+            ]
+        ).lower()
+        if "earnings per share" in haystack:
+            return True
+        if re.search(r"\\bgaap\\b", haystack) and re.search(r"\\beps\\b", haystack):
+            return True
+        if re.search(r"\\beps\\b", haystack) and "diluted" in haystack:
+            return True
+        return False
+
+    @staticmethod
+    def _nasdaq_user_agent() -> str:
+        ua = os.getenv("NASDAQ_USER_AGENT", "").strip()
+        if ua:
+            return ua
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        )
+
+    @classmethod
+    def _nasdaq_get_json(
+        cls, url: str, *, timeout_s: int = 30, allowed_tries: int = 2
+    ) -> dict:
+        headers = {
+            "User-Agent": cls._nasdaq_user_agent(),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nasdaq.com/",
+            "Origin": "https://www.nasdaq.com",
+        }
+
+        def _curl_get_json() -> dict:
+            curl = shutil.which("curl") or shutil.which("curl.exe")
+            if not curl:
+                raise FileNotFoundError(
+                    "curl not found (needed for Nasdaq API fallback)."
+                )
+
+            cmd = [
+                curl,
+                "-sS",
+                "-L",
+                "--compressed",
+                url,
+                "--max-time",
+                str(int(timeout_s)),
+            ]
+            for k, v in headers.items():
+                cmd.extend(["-H", f"{k}: {v}"])
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout or "").strip()
+                raise RuntimeError(f"curl failed ({proc.returncode}): {msg[:200]}")
+
+            data = json.loads(proc.stdout)
+            if not isinstance(data, dict):
+                raise ValueError("Unexpected Nasdaq API response type")
+            return data
+
+        allowed_tries = max(1, int(allowed_tries))
+        last_error: BaseException | None = None
+        for attempt in range(1, allowed_tries + 1):
+            try:
+                try:
+                    return _curl_get_json()
+                except BaseException as curl_e:
+                    last_error = curl_e
+                resp = requests.get(
+                    url, headers=headers, timeout=(min(5, timeout_s), timeout_s)
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise ValueError("Unexpected Nasdaq API response type")
+                return data
+            except BaseException as e:
+                last_error = e
+                if attempt >= allowed_tries:
+                    raise
+                time.sleep(0.4 * attempt)
+        raise last_error if last_error is not None else RuntimeError(
+            "Nasdaq API request failed without an exception"
+        )
+
+    async def _free_eps_research_from_nasdaq(
+        self, ticker: str, *, include_error: bool = False
+    ) -> str:
+        """
+        Free, deterministic earnings/EPS context from Nasdaq's public endpoints.
+
+        This is especially useful for near-term EPS questions where the best baseline
+        is the analyst consensus (and where Exa/general web search is often overkill).
+        """
+
+        ticker = ticker.strip().upper()
+        if not ticker:
+            return ""
+
+        earnings_date_url = (
+            f"https://api.nasdaq.com/api/analyst/{ticker}/earnings-date"
+        )
+        earnings_forecast_url = (
+            f"https://api.nasdaq.com/api/analyst/{ticker}/earnings-forecast"
+        )
+
+        def fetch() -> tuple[dict, dict]:
+            date_json = self._nasdaq_get_json(earnings_date_url)
+            forecast_json = self._nasdaq_get_json(earnings_forecast_url)
+            return date_json, forecast_json
+
+        try:
+            date_json, forecast_json = await asyncio.to_thread(fetch)
+        except Exception as e:
+            msg = (
+                f"Free Nasdaq research failed for {ticker}: {e.__class__.__name__}: {e}"
+            )
+            if include_error:
+                return msg
+            logger.warning(msg)
+            return ""
+
+        date_data = date_json.get("data") if isinstance(date_json, dict) else None
+        if not isinstance(date_data, dict):
+            date_data = {}
+
+        forecast_data = (
+            forecast_json.get("data") if isinstance(forecast_json, dict) else None
+        )
+        if not isinstance(forecast_data, dict):
+            forecast_data = {}
+
+        announcement = date_data.get("announcement")
+        report_text = date_data.get("reportText")
+
+        consensus_line = ""
+        quarterly = forecast_data.get("quarterlyForecast")
+        if isinstance(quarterly, dict):
+            rows = quarterly.get("rows")
+            if isinstance(rows, list) and rows:
+                row0 = rows[0] if isinstance(rows[0], dict) else None
+                if isinstance(row0, dict):
+                    fiscal_end = row0.get("fiscalEnd")
+                    consensus = row0.get("consensusEPSForecast")
+                    high = row0.get("highEPSForecast")
+                    low = row0.get("lowEPSForecast")
+                    n_est = row0.get("noOfEstimates")
+                    up = row0.get("up")
+                    down = row0.get("down")
+                    consensus_line = (
+                        f"- Consensus EPS forecast (fiscal end {fiscal_end}): {consensus} "
+                        f"(high {high}, low {low}, n={n_est}, rev up/down={up}/{down})"
+                    )
+
+        lines: list[str] = []
+        lines.append(f"Free data sources (Nasdaq Analyst API) for {ticker}:")
+        if announcement:
+            lines.append(f"- {announcement}")
+        if consensus_line:
+            lines.append(consensus_line)
+        if report_text:
+            lines.append(f"- Nasdaq summary: {report_text}")
+        lines.append("Sources:")
+        lines.append(f"- {earnings_date_url}")
+        lines.append(f"- {earnings_forecast_url}")
+        return "\n".join(lines).strip()
+
+    async def _run_free_research(
+        self, *, question: MetaculusQuestion, strategy: str
+    ) -> str:
+        strategy = (strategy or "").strip().lower()
+        if strategy in {"free/nasdaq-eps", "free/nasdaq-earnings", "free/nasdaq"}:
+            if not self._looks_like_eps_question(question):
+                return ""
+            ticker = self._infer_ticker_symbol(question)
+            if not ticker:
+                return ""
+            return await self._free_eps_research_from_nasdaq(
+                ticker, include_error=True
+            )
+        return f"Unknown free research strategy: {strategy!r}"
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
             researcher = self.get_llm("researcher")
+
+            if isinstance(researcher, str) and researcher.strip().lower().startswith(
+                "free/"
+            ):
+                strategy = researcher.strip()
+                research = await self._run_free_research(
+                    question=question, strategy=strategy
+                )
+                logger.info(
+                    f"Found Research for URL {question.page_url} (free strategy {strategy}):\n{research}"
+                )
+                return research
+
+            if _env_bool("BOT_ENABLE_FREE_EPS_PREFETCH", True):
+                ticker = (
+                    self._infer_ticker_symbol(question)
+                    if self._looks_like_eps_question(question)
+                    else None
+                )
+                if ticker:
+                    research = await self._free_eps_research_from_nasdaq(ticker)
+                    if research:
+                        logger.info(
+                            f"Found Research for URL {question.page_url} (free Nasdaq prefetch {ticker}):\n{research}"
+                        )
+                        return research
 
             researcher_model_name = GeneralLlm.to_model_name(researcher)
             researcher_model_name_lower = researcher_model_name.lower()
@@ -1059,10 +1306,14 @@ class SpringTemplateBot2026(ForecastBot):
                 Question:
                 {question.question_text}
 
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
+                Background info (may include key definitions + links to authoritative sources):
+                {question.background_info or ""}
 
-                {question.fine_print}
+                This question's outcome will be determined by the specific criteria below:
+                {question.resolution_criteria or ""}
+
+                Fine print:
+                {question.fine_print or ""}
                 """
             )
 

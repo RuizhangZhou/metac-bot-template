@@ -82,3 +82,4 @@ jobs:
           MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
           MATRIX_NOTIFY_ALWAYS: "true"
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || secrets.SEC_USER_AGENT }}

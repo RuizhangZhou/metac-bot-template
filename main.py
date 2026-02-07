@@ -168,7 +168,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Override research strategy/model. Examples: "
-            "'no_research', 'asknews/news-summaries', "
+            "'no_research', 'free/nasdaq-eps', 'asknews/news-summaries', "
             "'asknews/deep-research/low-depth', 'smart-searcher/<model>'."
         ),
     )
@@ -358,12 +358,14 @@ if __name__ == "__main__":
                     tournament_id=tournament_id,
                 )
                 logging.getLogger(__name__).info(
-                    "Tournament update scan (%s): total_open=%s, queued_unforecasted=%s, queued_cp_changed=%s, skipped_missing_cp=%s",
+                    "Tournament update scan (%s): total_open=%s, queued_unforecasted=%s, queued_cp_changed=%s, queued_diverged_from_cp=%s, skipped_missing_cp=%s, skipped_missing_my_forecast=%s",
                     tournament_id,
                     counts.get("total_open"),
                     counts.get("queued_unforecasted"),
                     counts.get("queued_cp_changed"),
+                    counts.get("queued_diverged_from_cp"),
                     counts.get("skipped_missing_cp"),
+                    counts.get("skipped_missing_my_forecast"),
                 )
                 if not questions_to_forecast:
                     continue

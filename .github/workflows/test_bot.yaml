@@ -52,3 +52,4 @@ jobs:
           BOT_REQUIRE_KICONNECT: "true"
           BOT_ENABLE_FALLBACK: "true"
           BOT_FALLBACK_MODEL: "openrouter/openai/gpt-oss-120b:free"
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || secrets.SEC_USER_AGENT }}

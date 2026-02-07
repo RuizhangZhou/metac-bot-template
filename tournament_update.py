@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from forecasting_tools import MetaculusClient, MetaculusQuestion
 
-from digest_mode import _get_close_time_iso, _is_significant_change
+from digest_mode import (
+    _approx_median_from_percentiles,
+    _extract_account_prediction_from_question_json,
+    _get_close_time_iso,
+    _get_numeric_percentile_map,
+    _is_significant_change,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +142,24 @@ def _extract_cp_from_aggregation_item(
         return None
 
     if question_type in {"numeric", "date", "discrete"}:
+        forecast_values = _extract_float_list(aggregation_item.get("forecast_values"))
+        if forecast_values is None:
+            forecast_values = _extract_float_list(aggregation_item.get("continuous_cdf"))
+        if forecast_values and len(forecast_values) > 1:
+            continuous_range = _continuous_range_from_scaling(
+                question_json=question_json, num_points=len(forecast_values)
+            )
+            if continuous_range and len(continuous_range) == len(forecast_values):
+                declared_percentiles: list[dict[str, float]] = []
+                for x, cdf in zip(continuous_range, forecast_values):
+                    if not (0.0 <= float(cdf) <= 1.0):
+                        continue
+                    declared_percentiles.append(
+                        {"percentile": float(cdf), "value": float(x)}
+                    )
+                if declared_percentiles:
+                    return {"declared_percentiles": declared_percentiles}
+
         centers = _extract_float_list(aggregation_item.get("centers"))
         if centers and len(centers) == 1:
             center = float(centers[0])
@@ -151,30 +176,13 @@ def _extract_cp_from_aggregation_item(
                 and len(lower_bounds) == 1
                 and len(upper_bounds) == 1
             ):
-                declared.insert(0, {"percentile": 0.1, "value": float(lower_bounds[0])})
+                declared.insert(
+                    0, {"percentile": 0.1, "value": float(lower_bounds[0])}
+                )
                 declared.append({"percentile": 0.9, "value": float(upper_bounds[0])})
             return {"declared_percentiles": declared}
 
-        forecast_values = _extract_float_list(aggregation_item.get("forecast_values"))
-        if forecast_values is None:
-            forecast_values = _extract_float_list(aggregation_item.get("continuous_cdf"))
-        if not forecast_values:
-            return None
-
-        continuous_range = _continuous_range_from_scaling(
-            question_json=question_json, num_points=len(forecast_values)
-        )
-        if not continuous_range or len(continuous_range) != len(forecast_values):
-            return None
-
-        declared_percentiles: list[dict[str, float]] = []
-        for x, cdf in zip(continuous_range, forecast_values):
-            if not (0.0 <= float(cdf) <= 1.0):
-                continue
-            declared_percentiles.append(
-                {"percentile": float(cdf), "value": float(x)}
-            )
-        return {"declared_percentiles": declared_percentiles} if declared_percentiles else None
+        return None
 
     return None
 
@@ -252,6 +260,115 @@ def _question_json_from_question(question: MetaculusQuestion) -> dict | None:
     return question_json if isinstance(question_json, dict) else None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _is_significant_divergence_from_community(
+    *,
+    my_pred: object,
+    community_pred: object,
+    question_type: str,
+) -> tuple[bool, str]:
+    """
+    Heuristic for "bot seems off vs community", to trigger a re-forecast.
+
+    This is intentionally more conservative than `_is_significant_change` to
+    avoid churning updates just because the bot is modestly contrarian.
+    """
+
+    if question_type == "binary":
+        if not isinstance(my_pred, (int, float)) or not isinstance(
+            community_pred, (int, float)
+        ):
+            return False, "binary_type_mismatch"
+        abs_delta = abs(float(my_pred) - float(community_pred))
+        threshold = _env_float("BOT_UPDATE_ON_CP_DIVERGENCE_BINARY_ABS_DELTA", 0.20)
+        return abs_delta >= threshold, f"abs_delta={abs_delta:.3f}"
+
+    if question_type == "multiple_choice":
+        if not isinstance(my_pred, dict) or not isinstance(community_pred, dict):
+            return False, "mc_type_mismatch"
+        keys = sorted(set(my_pred) | set(community_pred))
+        tvd = 0.5 * sum(
+            abs(float(community_pred.get(k, 0.0)) - float(my_pred.get(k, 0.0)))
+            for k in keys
+        )
+        threshold = _env_float("BOT_UPDATE_ON_CP_DIVERGENCE_MC_TVD", 0.25)
+        return tvd >= threshold, f"tvd={tvd:.3f}"
+
+    if question_type in {"numeric", "date", "discrete"}:
+        if not isinstance(my_pred, dict) or not isinstance(community_pred, dict):
+            return False, "numeric_type_mismatch"
+
+        my_map = _get_numeric_percentile_map(my_pred)
+        cp_map = _get_numeric_percentile_map(community_pred)
+        my_med = _approx_median_from_percentiles(my_map)
+        cp_med = _approx_median_from_percentiles(cp_map)
+        if my_med is None or cp_med is None:
+            return False, "missing_median"
+
+        my_p10 = my_map.get(0.1)
+        my_p90 = my_map.get(0.9)
+        cp_p10 = cp_map.get(0.1)
+        cp_p90 = cp_map.get(0.9)
+        my_width = (
+            (my_p90 - my_p10) if (my_p10 is not None and my_p90 is not None) else None
+        )
+        cp_width = (
+            (cp_p90 - cp_p10) if (cp_p10 is not None and cp_p90 is not None) else None
+        )
+
+        width: float
+        if my_width is not None and cp_width is not None:
+            width = max(1e-9, 0.5 * (my_width + cp_width))
+        elif my_width is not None:
+            width = max(1e-9, my_width)
+        elif cp_width is not None:
+            width = max(1e-9, cp_width)
+        else:
+            width = max(1e-9, abs(float(my_med)), abs(float(cp_med)))
+
+        normalized_median_shift = abs(float(cp_med) - float(my_med)) / width
+        threshold = _env_float(
+            "BOT_UPDATE_ON_CP_DIVERGENCE_NUM_NORM_MEDIAN_SHIFT", 0.60
+        )
+
+        if question_type == "date":
+            median_shift_days = abs(float(cp_med) - float(my_med)) / 86400
+            abs_days = _env_float("BOT_UPDATE_ON_CP_DIVERGENCE_DATE_ABS_DAYS", 60.0)
+            if median_shift_days >= abs_days:
+                return True, f"median_shift_days={median_shift_days:.1f}"
+
+        return (
+            normalized_median_shift >= threshold,
+            f"norm_median_shift={normalized_median_shift:.3f}",
+        )
+
+    return False, f"unsupported_type_{question_type}"
+
+
 def _get_full_question_json(
     *,
     client: MetaculusClient,
@@ -289,6 +406,7 @@ def select_questions_for_tournament_update(
     Returns questions that should be re-forecasted:
     - Any open question the bot has never forecasted
     - Any open question where community prediction has shifted significantly since the bot's last forecast
+    - Any open question where the bot's last forecast is far from the current community prediction
 
     This relies on Metaculus aggregation history and the bot's "my_forecasts.latest.start_time".
     No local state is required (works well on ephemeral GitHub Actions runners).
@@ -304,8 +422,10 @@ def select_questions_for_tournament_update(
         "total_open": len(questions),
         "queued_unforecasted": 0,
         "queued_cp_changed": 0,
+        "queued_diverged_from_cp": 0,
         "skipped_no_last_forecast_time": 0,
         "skipped_missing_cp": 0,
+        "skipped_missing_my_forecast": 0,
         "skipped_other": 0,
     }
     selected: list[MetaculusQuestion] = []
@@ -376,5 +496,30 @@ def select_questions_for_tournament_update(
             counts["queued_cp_changed"] += 1
             url = getattr(question, "page_url", None) or f"post:{getattr(question, 'id_of_post', '')}"
             logger.info(f"Queueing update ({reason}) for {url}")
+            continue
+
+        if not _env_bool("BOT_ENABLE_UPDATE_ON_CP_DIVERGENCE", True):
+            continue
+
+        my_pred = _extract_account_prediction_from_question_json(
+            question_json=question_json,
+            question_type=qtype,
+        )
+        if my_pred is None:
+            counts["skipped_missing_my_forecast"] += 1
+            continue
+
+        diverged, divergence_reason = _is_significant_divergence_from_community(
+            my_pred=my_pred,
+            community_pred=new_cp,
+            question_type=qtype,
+        )
+        if diverged:
+            selected.append(question)
+            counts["queued_diverged_from_cp"] += 1
+            url = getattr(question, "page_url", None) or f"post:{getattr(question, 'id_of_post', '')}"
+            logger.info(
+                f"Queueing update (diverged_from_cp: {divergence_reason}) for {url}"
+            )
 
     return selected, counts
