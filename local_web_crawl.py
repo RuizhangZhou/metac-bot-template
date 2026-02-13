@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -61,6 +63,9 @@ class LocalCrawlLimits:
     per_url_char_budget: int = 4_000
     truncation_marker: str = "\n\n[TRUNCATED]"
     blocked_resource_types: frozenset[str] = frozenset({"image", "font", "media"})
+    allow_private_hosts: bool = False
+    ignore_https_errors: bool = False
+    resolve_dns: bool = True
 
 
 class PlaywrightWebPageParser:
@@ -76,6 +81,7 @@ class PlaywrightWebPageParser:
         self._pw = None
         self._browser = None
         self._launch_lock = asyncio.Lock()
+        self._host_safety_cache: dict[str, bool] = {}
 
     async def _ensure_browser(self) -> None:
         if self._browser is not None and self._pw is not None:
@@ -112,7 +118,73 @@ class PlaywrightWebPageParser:
             except Exception:
                 logger.exception("Failed to stop Playwright cleanly")
 
+    @staticmethod
+    def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return bool(getattr(ip, "is_global", False))
+
+    async def is_url_safe_for_crawl(self, url: str) -> bool:
+        url = (url or "").strip()
+        if not url:
+            return False
+
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme in {"data", "blob", "about"}:
+            return True
+        if scheme not in {"http", "https"}:
+            return False
+
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return False
+
+        if self._limits.allow_private_hosts:
+            return True
+
+        if host == "localhost" or host.endswith(".localhost"):
+            return False
+        if host.endswith(".local") or host.endswith(".internal"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+
+        if ip is not None:
+            return self._ip_is_public(ip)
+
+        if not self._limits.resolve_dns:
+            return True
+
+        cached = self._host_safety_cache.get(host)
+        if cached is not None:
+            return cached
+
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+        except Exception:
+            self._host_safety_cache[host] = False
+            return False
+
+        for info in infos:
+            sockaddr = info[4]
+            ip_str = sockaddr[0] if sockaddr else ""
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+            if not self._ip_is_public(ip):
+                self._host_safety_cache[host] = False
+                return False
+
+        self._host_safety_cache[host] = True
+        return True
+
     async def get_clean_text(self, url: str) -> str:
+        if not await self.is_url_safe_for_crawl(url):
+            raise ValueError("Blocked URL (unsafe host or scheme)")
+
         await self._ensure_browser()
         assert self._browser is not None
 
@@ -120,7 +192,7 @@ class PlaywrightWebPageParser:
             context = await self._browser.new_context(
                 user_agent=self._user_agent,
                 java_script_enabled=True,
-                ignore_https_errors=True,
+                ignore_https_errors=bool(self._limits.ignore_https_errors),
             )
             try:
                 await self._apply_resource_blocking(context)
@@ -139,7 +211,11 @@ class PlaywrightWebPageParser:
                             timeout=self._limits.network_idle_timeout_seconds * 1000,
                         )
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Ignoring failure while waiting for network idle state for %s",
+                            url,
+                            exc_info=True,
+                        )
 
                     html = await page.content()
                     rendered_text = await page.evaluate(
@@ -159,24 +235,31 @@ class PlaywrightWebPageParser:
                     self._limits.truncation_marker,
                 )
             finally:
-                await context.close()
+                try:
+                    await context.close()
+                except Exception:
+                    logger.debug("Failed to close Playwright context", exc_info=True)
 
     async def _apply_resource_blocking(self, context: object) -> None:
         blocked = set(self._limits.blocked_resource_types or [])
-        if not blocked:
-            return
 
         async def handle_route(route, request) -> None:  # type: ignore[no-untyped-def]
             try:
+                if not await self.is_url_safe_for_crawl(request.url):
+                    await route.abort()
+                    return
                 if request.resource_type in blocked:
                     await route.abort()
                 else:
                     await route.continue_()
             except Exception:
                 try:
-                    await route.continue_()
+                    await route.abort()
                 except Exception:
-                    pass
+                    logger.debug(
+                        "Failed to abort Playwright route after handler error",
+                        exc_info=True,
+                    )
 
         try:
             await context.route("**/*", handle_route)  # type: ignore[attr-defined]
@@ -221,6 +304,9 @@ async def crawl_urls(
         url = (url or "").strip()
         if not url or not (url.startswith("http://") or url.startswith("https://")):
             continue
+        if not await parser.is_url_safe_for_crawl(url):
+            logger.info(f"Skipping unsafe URL for local crawl: {url}")
+            continue
         if url in seen:
             continue
         seen.add(url)
@@ -252,7 +338,7 @@ async def crawl_urls(
         if err is not None:
             logger.info(f"Local crawl failed for {url}: {err}")
             results.append(
-                f"Source: {url}\n[ERROR] {err.__class__.__name__}: {err}"
+                f"Source: {url}\n[ERROR] Failed to fetch content for this URL."
             )
             continue
         if not text:
