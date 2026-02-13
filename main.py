@@ -21,6 +21,7 @@ from forecasting_tools import GeneralLlm, MetaculusClient
 
 from template_bot_2026 import SpringTemplateBot2026
 from retrospective_mode import run_retrospective
+from weekly_retrospective_mode import run_weekly_retrospective
 
 
 def _notify_matrix_on_submit(
@@ -160,6 +161,7 @@ if __name__ == "__main__":
             "test_questions",
             "digest",
             "retrospective",
+            "weekly_retrospective",
         ],
         default="tournament",
         help="Specify the run mode (default: tournament)",
@@ -221,6 +223,7 @@ if __name__ == "__main__":
         "test_questions",
         "digest",
         "retrospective",
+        "weekly_retrospective",
     ] = (
         args.mode
     )
@@ -239,6 +242,11 @@ if __name__ == "__main__":
     if run_mode == "retrospective" and publish_to_metaculus:
         logging.getLogger(__name__).warning(
             "--submit ignored in retrospective mode (no submission)."
+        )
+        publish_to_metaculus = False
+    if run_mode == "weekly_retrospective" and publish_to_metaculus:
+        logging.getLogger(__name__).warning(
+            "--submit ignored in weekly_retrospective mode (no submission)."
         )
         publish_to_metaculus = False
 
@@ -279,6 +287,59 @@ if __name__ == "__main__":
                 )
             )
             print(markdown)
+        raise SystemExit(0)
+
+    if run_mode == "weekly_retrospective":
+        client = MetaculusClient()
+        if args.tournaments_file or args.tournament:
+            tournaments, unsupported = load_tournament_identifiers(
+                args.tournaments_file, args.tournament
+            )
+            for item in unsupported:
+                logging.getLogger(__name__).warning(
+                    f"Unsupported collection (not a tournament): {item}"
+                )
+            if not tournaments:
+                raise SystemExit(
+                    "No valid tournaments configured via --tournaments-file/--tournament."
+                )
+        else:
+            market_pulse_env = os.getenv("MARKET_PULSE_TOURNAMENT", "").strip()
+            market_raw = market_pulse_env or client.CURRENT_MARKET_PULSE_ID
+            market_id = extract_tournament_identifier(market_raw)
+
+            aib_raw = os.getenv("AIB_TOURNAMENT", "").strip() or client.CURRENT_AI_COMPETITION_ID
+            aib_id = extract_tournament_identifier(aib_raw)
+
+            minibench_id = extract_tournament_identifier(client.CURRENT_MINIBENCH_ID)
+
+            cup_raw = os.getenv("METACULUS_CUP_TOURNAMENT", "").strip() or "metaculus-cup-spring-2026"
+            cup_id = extract_tournament_identifier(cup_raw)
+
+            tournaments = [
+                t
+                for t in [market_id, aib_id, minibench_id, cup_id]
+                if t and not t.startswith("index:")
+            ]
+            if not tournaments:
+                raise SystemExit(
+                    "No tournaments configured for weekly_retrospective. Set MARKET_PULSE_TOURNAMENT/AIB_TOURNAMENT/METACULUS_CUP_TOURNAMENT or pass --tournament."
+                )
+
+        out_dir = Path("reports") / "retrospective_weekly"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        out_path = out_dir / f"weekly_{stamp}.md"
+        state_path = Path(".state") / "weekly_retrospective_state.json"
+        markdown = asyncio.run(
+            run_weekly_retrospective(
+                client=client,
+                tournaments=tournaments,
+                out_path=out_path,
+                state_path=state_path,
+            )
+        )
+        print(markdown)
         raise SystemExit(0)
 
     llms: dict[str, object] | None = None
