@@ -76,6 +76,27 @@ _RESEARCH_FORECAST_LINE_RE = re.compile(
     r"^\s*Probability\s*:\s*\d{1,3}(?:\.\d+)?\s*%\s*$", re.IGNORECASE
 )
 
+_FORECAST_PROBABILITY_PERCENT_RE = re.compile(
+    r"Probability\s*:\s*(\d{1,3}(?:\.\d+)?)\s*%", re.IGNORECASE
+)
+
+
+def _extract_probability_percent(text: str) -> float | None:
+    if not text:
+        return None
+    matches = list(_FORECAST_PROBABILITY_PERCENT_RE.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    raw = last.group(1)
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value < 0 or value > 100:
+        return None
+    return value
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -2778,14 +2799,56 @@ class SpringTemplateBot2026(ForecastBot):
             "default", prompt, context=f"Binary forecast reasoning ({question.page_url})"
         )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = (
-            await self._structure_output_with_transient_fallback(
-                text_to_structure=reasoning,
-                output_type=BinaryPrediction,
-                context=f"Binary parse ({question.page_url})",
-            )
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+
+        percent = _extract_probability_percent(reasoning)
+        if percent is not None:
+            decimal_pred = percent / 100.0
+        else:
+            try:
+                binary_prediction: BinaryPrediction = (
+                    await self._structure_output_with_transient_fallback(
+                        text_to_structure=reasoning,
+                        output_type=BinaryPrediction,
+                        context=f"Binary parse ({question.page_url})",
+                    )
+                )
+                decimal_pred = float(binary_prediction.prediction_in_decimal)
+            except Exception as e:
+                logger.warning(
+                    f"Binary parse failed ({question.page_url}); retrying by asking for the missing probability line. Error: {e}"
+                )
+                reasoning_excerpt = self._truncate_for_router(reasoning, 6000)
+                fix_prompt = clean_indents(
+                    f"""
+                    You previously wrote a rationale for a binary forecast but forgot to include the final required line.
+
+                    Output ONLY the final answer line in this exact format:
+                    Probability: ZZ%
+
+                    Do not output anything else.
+
+                    Question:
+                    {question.question_text}
+
+                    Rationale (excerpt):
+                    {reasoning_excerpt}
+                    """
+                )
+                fix = await self._invoke_llm_with_transient_fallback(
+                    "default",
+                    fix_prompt,
+                    context=f"Binary forecast probability fix ({question.page_url})",
+                )
+                logger.info(
+                    f"Binary forecast probability fix ({question.page_url}): {fix}"
+                )
+                fixed_percent = _extract_probability_percent(fix)
+                if fixed_percent is None:
+                    raise
+                reasoning = (reasoning.rstrip() + "\n" + fix.strip()).strip()
+                decimal_pred = fixed_percent / 100.0
+
+        decimal_pred = max(0.01, min(0.99, float(decimal_pred)))
         decimal_pred = self._calibrate_binary_probability(
             question=question,
             p=decimal_pred,
