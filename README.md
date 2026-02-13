@@ -62,6 +62,13 @@ If you want a simple postmortem on how the bot performed on already-resolved que
 - Or specify tournaments: `poetry run python main.py --mode retrospective --tournament market-pulse-26q1`
 - Output: `reports/retrospective/<tournament>_YYYY-MM-DD.md`
 
+## Weekly retrospective (last 7 days)
+To review newly-resolved questions on a schedule (e.g. weekend), use `--mode weekly_retrospective`.
+
+- Run locally: `poetry run python main.py --mode weekly_retrospective`
+- Optional: set `BOT_WEEKLY_RETRO_DAYS_LOOKBACK=7` (or another window)
+- Output: `reports/retrospective_weekly/weekly_YYYY-MM-DD.md`
+
 ## Research providers (AskNews / others)
 - AskNews research is optional. If your AskNews plan does not allow API access, runs may fail unless you disable it.
 - Disable research (cheapest/minimal): `poetry run python main.py --mode tournament --tournament climate --no-submit --researcher no_research`
