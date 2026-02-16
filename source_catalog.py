@@ -83,6 +83,7 @@ def apply_patch_ops(
       }
     """
     base = load_catalog(dump_catalog(catalog))
+    original_updated_at = base.get("updated_at")
     sources_raw = base.get("sources", [])
     sources: list[dict[str, Any]] = [
         s for s in sources_raw if isinstance(s, dict) and _is_valid_url(str(s.get("url", "")))
@@ -182,6 +183,8 @@ def apply_patch_ops(
     new_sources = list(by_url.values())
     new_sources.sort(key=lambda s: str(s.get("url", "")))
     base["sources"] = new_sources
-    base["updated_at"] = _now_iso()
+    if summary.added or summary.removed or summary.updated:
+        base["updated_at"] = _now_iso()
+    else:
+        base["updated_at"] = str(original_updated_at or base.get("updated_at") or _now_iso())
     return base, summary
-
