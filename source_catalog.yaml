@@ -1,0 +1,8 @@
+version: 1
+# Human-curated (but bot-maintained) list of high-signal sources to consult.
+# - This file is safe to auto-update on `main` (restricted to this file only).
+# - Entries are keyed by `url` (exact match).
+# - The bot may add/remove/update entries over time based on retrospectives.
+updated_at: 1970-01-01T00:00:00+00:00
+sources: []
+
