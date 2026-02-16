@@ -343,7 +343,11 @@ async def _llm_weekly_analysis_and_catalog_ops(
     )
 
     llm = GeneralLlm(model=model, temperature=0.0, timeout=120)
-    text = await llm.invoke(prompt, system_prompt=system_prompt)
+    try:
+        text = await llm.invoke(prompt, system_prompt=system_prompt)
+    except Exception:
+        logger.info("Weekly LLM analysis failed; continuing without it", exc_info=True)
+        return "", None
     data = _try_parse_json_object(text)
     if not isinstance(data, dict):
         return "", None
