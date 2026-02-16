@@ -33,11 +33,25 @@ from retrospective_mode import (
 )
 from tournament_update import _extract_cp_at_time, _extract_cp_latest
 
+from github_contents import GithubContentsClient, get_github_repo, get_github_token
+
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DAYS_LOOKBACK = 7
 _DEFAULT_MAX_QUESTIONS_PER_TOURNAMENT = 100
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 @dataclass(frozen=True)
@@ -421,6 +435,36 @@ async def run_weekly_retrospective(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(markdown, encoding="utf-8")
         _save_processed_state(state_path, updated_processed)
+
+        publish_report = _env_bool("BOT_WEEKLY_RETRO_PUBLISH_REPORT", True)
+        report_branch = os.getenv("BOT_WEEKLY_RETRO_REPORT_BRANCH", "reports/weekly").strip()
+        if publish_report and report_branch:
+            token = get_github_token()
+            repo = get_github_repo()
+            if token and repo:
+                try:
+                    gh = GithubContentsClient(token=token, repo=repo)
+                    gh.ensure_branch(branch=report_branch, from_branch="main")
+                    remote_path = out_path.as_posix()
+                    stamp = window_end.date().isoformat()
+                    gh.upsert_file(
+                        path=remote_path,
+                        branch=report_branch,
+                        message=f"Weekly retrospective report ({stamp})",
+                        content=markdown,
+                    )
+                    logger.info(
+                        "Published weekly retrospective report to %s:%s",
+                        report_branch,
+                        remote_path,
+                    )
+                except Exception:
+                    logger.info(
+                        "Failed to publish weekly retrospective report; continuing",
+                        exc_info=True,
+                    )
+            else:
+                logger.info("Skipping weekly report publish: missing GitHub token or repo")
         return markdown
     finally:
         session.close()
