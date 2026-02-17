@@ -31,6 +31,14 @@ from local_web_crawl import (
     extract_http_urls,
 )
 
+from tool_trace import (
+    ensure_tool_trace_base,
+    extract_urls as extract_urls_from_text,
+    record_urls as tool_trace_record_urls,
+    record_value as tool_trace_record_value,
+    render_tool_trace_markdown,
+)
+
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -62,6 +70,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 _NOTEPAD_LOCAL_CRAWL_TASK_KEY = "local_crawl_context_task"
 _NOTEPAD_TOOL_ROUTER_PLAN_KEY = "tool_router_plan"
+_NOTEPAD_TOOL_TRACE_KEY = "tool_trace"
 
 
 class ToolRouterPlan(BaseModel):
@@ -408,6 +417,18 @@ class SpringTemplateBot2026(ForecastBot):
     @staticmethod
     def _tool_router_enabled() -> bool:
         return _env_bool("BOT_ENABLE_TOOL_ROUTER", True)
+
+    @staticmethod
+    def _tool_trace_enabled() -> bool:
+        return _env_bool("BOT_ENABLE_TOOL_TRACE", True)
+
+    @staticmethod
+    def _tool_trace_max_urls() -> int:
+        return _env_int("BOT_TOOL_TRACE_MAX_URLS", 25)
+
+    @staticmethod
+    def _tool_trace_max_chars() -> int:
+        return _env_int("BOT_TOOL_TRACE_MAX_CHARS", 8000)
 
     @staticmethod
     def _truncate_for_router(text: str, max_chars: int) -> str:
@@ -2421,7 +2442,45 @@ class SpringTemplateBot2026(ForecastBot):
             if not researcher or researcher == "None" or researcher == "no_research":
                 return ""
 
+            tool_trace: dict | None = None
+            if self._tool_trace_enabled():
+                try:
+                    existing = (
+                        question.custom_metadata.get("tool_trace")
+                        if isinstance(getattr(question, "custom_metadata", None), dict)
+                        else None
+                    )
+                    tool_trace = ensure_tool_trace_base(
+                        existing,
+                        question_url=getattr(question, "page_url", None),
+                    )
+                    question.custom_metadata["tool_trace"] = tool_trace
+                    try:
+                        notepad = await self._get_notepad(question)
+                        notepad.note_entries[_NOTEPAD_TOOL_TRACE_KEY] = tool_trace
+                    except Exception:
+                        pass
+                except Exception:
+                    tool_trace = None
+
             local_crawl_context = await self._get_local_crawl_context_cached(question)
+            if tool_trace is not None:
+                crawled_urls: list[str] = []
+                for line in (local_crawl_context or "").splitlines():
+                    if line.startswith("Source: "):
+                        url = line.removeprefix("Source: ").strip()
+                        if url:
+                            crawled_urls.append(url)
+                tool_trace_record_urls(
+                    tool_trace,
+                    bucket="local_crawl_urls",
+                    urls=crawled_urls,
+                    max_urls=self._tool_trace_max_urls(),
+                )
+                tool_trace_record_value(
+                    tool_trace, key="local_crawl_chars", value=len(local_crawl_context)
+                )
+
             local_crawl_block = (
                 clean_indents(
                     f"""
@@ -2440,6 +2499,14 @@ class SpringTemplateBot2026(ForecastBot):
                 research = await self._run_free_research(
                     question=question, strategy=strategy
                 )
+                if tool_trace is not None:
+                    tool_trace_record_value(tool_trace, key="research_strategy", value=strategy)
+                    tool_trace_record_urls(
+                        tool_trace,
+                        bucket="free_research_urls",
+                        urls=extract_urls_from_text(research),
+                        max_urls=self._tool_trace_max_urls(),
+                    )
                 combined = "\n\n".join(
                     [part for part in [local_crawl_block, research] if part]
                 ).strip()
@@ -2462,22 +2529,54 @@ class SpringTemplateBot2026(ForecastBot):
             logger.info(
                 f"Tool router plan ({question.page_url}): {tool_plan.model_dump(mode='json')}"
             )
+            if tool_trace is not None:
+                tool_trace_record_value(
+                    tool_trace,
+                    key="research_strategy",
+                    value=researcher_model_name,
+                )
+                tool_trace_record_value(
+                    tool_trace, key="tool_router_plan", value=tool_plan.model_dump(mode="json")
+                )
 
             inferred_ticker = (self._infer_ticker_symbol(question) or "").strip().upper()
+            if tool_trace is not None and inferred_ticker:
+                tool_trace_record_value(tool_trace, key="inferred_ticker", value=inferred_ticker)
 
             official_context_parts: list[str] = []
             if tool_plan.fetch_sec_filings and inferred_ticker:
                 filings = await self._free_sec_filings_research_from_sec(inferred_ticker)
                 if filings:
                     official_context_parts.append(filings)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(filings),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
             if tool_plan.fetch_sec_revenue:
                 revenue = await self._free_revenue_research_from_sec(question)
                 if revenue:
                     official_context_parts.append(revenue)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(revenue),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
             if tool_plan.fetch_nasdaq_eps and inferred_ticker:
                 eps = await self._free_eps_research_from_nasdaq(inferred_ticker)
                 if eps:
                     official_context_parts.append(eps)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(eps),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
 
             official_context = "\n\n".join(official_context_parts).strip()
 
@@ -2489,6 +2588,17 @@ class SpringTemplateBot2026(ForecastBot):
             )
             use_web_search_for_call = bool(tool_plan.use_web_search)
             uses_web_search = bool(use_web_search_for_call and model_supports_web_search)
+            if tool_trace is not None:
+                tool_trace_record_value(
+                    tool_trace,
+                    key="web_search_requested",
+                    value=bool(use_web_search_for_call),
+                )
+                tool_trace_record_value(
+                    tool_trace,
+                    key="web_search_used",
+                    value=bool(uses_web_search),
+                )
             web_search_instructions = (
                 clean_indents(
                     """
@@ -2716,8 +2826,51 @@ class SpringTemplateBot2026(ForecastBot):
                     "researcher", prompt, context=f"Research ({question.page_url})"
                 )
             research = self._sanitize_research_report(research)
+            if tool_trace is not None and research:
+                tool_trace_record_urls(
+                    tool_trace,
+                    bucket="web_search_urls",
+                    urls=extract_urls_from_text(research),
+                    max_urls=self._tool_trace_max_urls(),
+                )
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    def _create_unified_explanation(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections: list,
+        aggregated_prediction: object,
+        final_cost: float,
+        time_spent_in_minutes: float,
+    ) -> str:
+        explanation = super()._create_unified_explanation(
+            question,
+            research_prediction_collections,
+            aggregated_prediction,
+            final_cost,
+            time_spent_in_minutes,
+        )
+
+        if not self._tool_trace_enabled():
+            return explanation
+
+        trace = (
+            question.custom_metadata.get("tool_trace")
+            if isinstance(getattr(question, "custom_metadata", None), dict)
+            else None
+        )
+        trace = ensure_tool_trace_base(
+            trace, question_url=getattr(question, "page_url", None)
+        )
+        if not trace:
+            return explanation
+
+        block = render_tool_trace_markdown(trace, max_chars=self._tool_trace_max_chars())
+        if not block:
+            return explanation
+
+        return explanation.strip() + "\n\n" + block + "\n"
 
     @classmethod
     def _sanitize_research_report(cls, text: str) -> str:
