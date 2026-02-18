@@ -39,6 +39,25 @@ from tool_trace import (
     render_tool_trace_markdown,
 )
 
+from official_structured_sources import (
+    BeaLimits,
+    BlsLimits,
+    EiaLimits,
+    FederalRegisterLimits,
+    FredLimits,
+    NoaaNhcLimits,
+    UsgsEarthquakeLimits,
+    derive_official_search_text,
+    prefetch_bea,
+    prefetch_bls,
+    prefetch_eia,
+    prefetch_federal_register,
+    prefetch_fred,
+    prefetch_noaa_nhc,
+    prefetch_usgs_earthquakes,
+    truncate_text as truncate_official_text,
+)
+
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -78,6 +97,13 @@ class ToolRouterPlan(BaseModel):
     fetch_sec_filings: bool
     fetch_sec_revenue: bool
     fetch_nasdaq_eps: bool
+    fetch_fred: bool
+    fetch_bls: bool
+    fetch_bea: bool
+    fetch_eia: bool
+    fetch_federal_register: bool
+    fetch_noaa_nhc: bool
+    fetch_usgs_earthquakes: bool
     notes: str | None = None
 
 
@@ -457,6 +483,13 @@ class SpringTemplateBot2026(ForecastBot):
             fetch_nasdaq_eps=has_ticker
             and looks_eps
             and _env_bool("BOT_ENABLE_FREE_EPS_PREFETCH", True),
+            fetch_fred=False,
+            fetch_bls=False,
+            fetch_bea=False,
+            fetch_eia=False,
+            fetch_federal_register=False,
+            fetch_noaa_nhc=False,
+            fetch_usgs_earthquakes=False,
             notes="fallback-default",
         )
 
@@ -486,6 +519,38 @@ class SpringTemplateBot2026(ForecastBot):
             and _env_bool("BOT_ENABLE_FREE_EPS_PREFETCH", True)
         )
 
+        has_fred_key = bool(os.getenv("FRED_API_KEY", "").strip())
+        has_bea_key = bool(os.getenv("BEA_API_KEY", "").strip())
+        has_eia_key = bool(os.getenv("EIA_API_KEY", "").strip())
+
+        fetch_fred = bool(
+            plan.fetch_fred
+            and has_fred_key
+            and _env_bool("BOT_ENABLE_FREE_FRED_PREFETCH", True)
+        )
+        fetch_bls = bool(plan.fetch_bls and _env_bool("BOT_ENABLE_FREE_BLS_PREFETCH", True))
+        fetch_bea = bool(
+            plan.fetch_bea
+            and has_bea_key
+            and _env_bool("BOT_ENABLE_FREE_BEA_PREFETCH", True)
+        )
+        fetch_eia = bool(
+            plan.fetch_eia
+            and has_eia_key
+            and _env_bool("BOT_ENABLE_FREE_EIA_PREFETCH", True)
+        )
+        fetch_federal_register = bool(
+            plan.fetch_federal_register
+            and _env_bool("BOT_ENABLE_FREE_FEDERAL_REGISTER_PREFETCH", True)
+        )
+        fetch_noaa_nhc = bool(
+            plan.fetch_noaa_nhc and _env_bool("BOT_ENABLE_FREE_NOAA_NHC_PREFETCH", True)
+        )
+        fetch_usgs_earthquakes = bool(
+            plan.fetch_usgs_earthquakes
+            and _env_bool("BOT_ENABLE_FREE_USGS_EARTHQUAKES_PREFETCH", True)
+        )
+
         use_web_search = bool(plan.use_web_search and _env_bool("BOT_ENABLE_WEB_SEARCH", True))
 
         return ToolRouterPlan(
@@ -493,6 +558,13 @@ class SpringTemplateBot2026(ForecastBot):
             fetch_sec_filings=fetch_sec_filings,
             fetch_sec_revenue=fetch_sec_revenue,
             fetch_nasdaq_eps=fetch_nasdaq_eps,
+            fetch_fred=fetch_fred,
+            fetch_bls=fetch_bls,
+            fetch_bea=fetch_bea,
+            fetch_eia=fetch_eia,
+            fetch_federal_register=fetch_federal_register,
+            fetch_noaa_nhc=fetch_noaa_nhc,
+            fetch_usgs_earthquakes=fetch_usgs_earthquakes,
             notes=(plan.notes or "").strip() or None,
         )
 
@@ -516,12 +588,14 @@ class SpringTemplateBot2026(ForecastBot):
             Goal: decide which retrieval sources to use for THIS Metaculus question, before writing the research report.
             Cost priority (cheapest/most reliable first):
             1) Local crawl extracts (already available; do not request again).
-            2) Free official deterministic sources (SEC/Nasdaq) when relevant.
+            2) Free official deterministic sources (SEC/Nasdaq/FRED/BLS/BEA/EIA/Federal Register/NOAA/USGS) when relevant.
             3) Web search (SmartSearcher/Exa or browsing models) only if needed.
 
             Rules:
             - Prefer to AVOID web search if local extracts + official sources are sufficient to answer the resolution criteria.
             - Only request SEC/Nasdaq tools if a valid US public-company ticker is available.
+            - Prefer official sources when the resolution criteria references an agency or official publication
+              (e.g., SEC filings, Federal Register rules, NOAA/NHC advisories, USGS feeds).
             - If the question asks for the latest status of an event (e.g., law passed, conflict outcome, election result),
               web search is usually required unless the local extracts already contain up-to-date primary sources.
             - Return ONLY the final JSON object, no other text.
@@ -533,6 +607,13 @@ class SpringTemplateBot2026(ForecastBot):
             - fetch_sec_filings: get recent SEC 10-K/10-Q/8-K links (submissions endpoint).
             - fetch_sec_revenue: get recent quarterly revenue series (companyfacts endpoint).
             - fetch_nasdaq_eps: get analyst consensus EPS forecast (Nasdaq analyst API).
+            - fetch_fred: query FRED (macro/finance time series; requires FRED_API_KEY).
+            - fetch_bls: query BLS time series (CPI/unemployment/jobs).
+            - fetch_bea: query BEA API (GDP/PCE; requires BEA_API_KEY).
+            - fetch_eia: query EIA API (energy/oil; requires EIA_API_KEY).
+            - fetch_federal_register: search Federal Register documents (rules/notices; no key).
+            - fetch_noaa_nhc: fetch NOAA NHC tropical outlook RSS (no key).
+            - fetch_usgs_earthquakes: fetch USGS earthquake feed (no key).
             - use_web_search: run SmartSearcher/Exa or a browsing model to find missing info.
 
             Inputs:
@@ -2578,7 +2659,183 @@ class SpringTemplateBot2026(ForecastBot):
                             max_urls=self._tool_trace_max_urls(),
                         )
 
+            official_truncation_marker = os.getenv(
+                "BOT_OFFICIAL_TRUNCATION_MARKER", "\n\n[TRUNCATED]"
+            )
+
+            if tool_plan.fetch_federal_register:
+                fr_limits = FederalRegisterLimits(
+                    timeout_seconds=_env_int("BOT_FEDERAL_REGISTER_TIMEOUT_SECONDS", 15),
+                    max_items=_env_int("BOT_FEDERAL_REGISTER_MAX_ITEMS", 5),
+                    days_back=_env_int("BOT_FEDERAL_REGISTER_DAYS_BACK", 365),
+                    max_chars=_env_int("BOT_FEDERAL_REGISTER_MAX_CHARS", 4000),
+                )
+                fr = await asyncio.to_thread(
+                    prefetch_federal_register,
+                    term=derive_official_search_text(question),
+                    limits=fr_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if fr:
+                    official_context_parts.append(fr)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(fr),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_usgs_earthquakes:
+                usgs_limits = UsgsEarthquakeLimits(
+                    timeout_seconds=_env_int("BOT_USGS_TIMEOUT_SECONDS", 15),
+                    max_items=_env_int("BOT_USGS_MAX_ITEMS", 6),
+                    days_back=_env_int("BOT_USGS_DAYS_BACK", 7),
+                    min_magnitude=_env_float("BOT_USGS_MIN_MAGNITUDE", 4.5),
+                    max_chars=_env_int("BOT_USGS_MAX_CHARS", 4000),
+                )
+                usgs = await asyncio.to_thread(
+                    prefetch_usgs_earthquakes,
+                    limits=usgs_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if usgs:
+                    official_context_parts.append(usgs)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(usgs),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_noaa_nhc:
+                nhc_limits = NoaaNhcLimits(
+                    timeout_seconds=_env_int("BOT_NOAA_NHC_TIMEOUT_SECONDS", 15),
+                    max_items=_env_int("BOT_NOAA_NHC_MAX_ITEMS", 3),
+                    max_chars=_env_int("BOT_NOAA_NHC_MAX_CHARS", 4000),
+                )
+                nhc = await asyncio.to_thread(
+                    prefetch_noaa_nhc,
+                    limits=nhc_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if nhc:
+                    official_context_parts.append(nhc)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(nhc),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_fred:
+                fred_limits = FredLimits(
+                    timeout_seconds=_env_int("BOT_FRED_TIMEOUT_SECONDS", 15),
+                    max_series=_env_int("BOT_FRED_MAX_SERIES", 3),
+                    max_observations=_env_int("BOT_FRED_MAX_OBSERVATIONS", 1),
+                    max_chars=_env_int("BOT_FRED_MAX_CHARS", 4000),
+                )
+                fred = await asyncio.to_thread(
+                    prefetch_fred,
+                    api_key=os.getenv("FRED_API_KEY", ""),
+                    search_text=derive_official_search_text(question),
+                    limits=fred_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if fred:
+                    official_context_parts.append(fred)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(fred),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_bls:
+                bls_limits = BlsLimits(
+                    timeout_seconds=_env_int("BOT_BLS_TIMEOUT_SECONDS", 15),
+                    max_series=_env_int("BOT_BLS_MAX_SERIES", 4),
+                    max_points=_env_int("BOT_BLS_MAX_POINTS", 12),
+                    years_back=_env_int("BOT_BLS_YEARS_BACK", 2),
+                    max_chars=_env_int("BOT_BLS_MAX_CHARS", 4000),
+                )
+                bls = await asyncio.to_thread(
+                    prefetch_bls,
+                    question=question,
+                    registration_key=os.getenv("BLS_API_KEY", ""),
+                    limits=bls_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if bls:
+                    official_context_parts.append(bls)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(bls),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_bea:
+                bea_limits = BeaLimits(
+                    timeout_seconds=_env_int("BOT_BEA_TIMEOUT_SECONDS", 20),
+                    max_points=_env_int("BOT_BEA_MAX_POINTS", 8),
+                    years_back=_env_int("BOT_BEA_YEARS_BACK", 6),
+                    max_chars=_env_int("BOT_BEA_MAX_CHARS", 4000),
+                )
+                bea = await asyncio.to_thread(
+                    prefetch_bea,
+                    question=question,
+                    api_key=os.getenv("BEA_API_KEY", ""),
+                    limits=bea_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if bea:
+                    official_context_parts.append(bea)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(bea),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
+            if tool_plan.fetch_eia:
+                eia_limits = EiaLimits(
+                    timeout_seconds=_env_int("BOT_EIA_TIMEOUT_SECONDS", 20),
+                    max_points=_env_int("BOT_EIA_MAX_POINTS", 14),
+                    max_chars=_env_int("BOT_EIA_MAX_CHARS", 4000),
+                )
+                eia = await asyncio.to_thread(
+                    prefetch_eia,
+                    question=question,
+                    api_key=os.getenv("EIA_API_KEY", ""),
+                    limits=eia_limits,
+                    truncation_marker=official_truncation_marker,
+                )
+                if eia:
+                    official_context_parts.append(eia)
+                    if tool_trace is not None:
+                        tool_trace_record_urls(
+                            tool_trace,
+                            bucket="official_urls",
+                            urls=extract_urls_from_text(eia),
+                            max_urls=self._tool_trace_max_urls(),
+                        )
+
             official_context = "\n\n".join(official_context_parts).strip()
+            official_total_budget = _env_int("BOT_OFFICIAL_TOTAL_CHAR_BUDGET", 12_000)
+            if official_total_budget <= 0:
+                official_context = ""
+            elif official_context:
+                official_context = truncate_official_text(
+                    official_context,
+                    max_chars=official_total_budget,
+                    marker=official_truncation_marker,
+                )
 
             model_supports_web_search = (
                 "search-preview" in researcher_model_name_lower
