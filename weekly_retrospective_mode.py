@@ -278,6 +278,7 @@ async def _llm_weekly_analysis_and_catalog_ops(
                 "official_urls",
                 "web_search_urls",
                 "free_research_urls",
+                "catalog_suggested_urls",
             ]:
                 value = r.tool_trace.get(key)
                 if isinstance(value, list):
