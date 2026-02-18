@@ -400,8 +400,10 @@ def prefetch_fred(
             header += f" — {latest_line}"
         lines.append(f"{header}: {series_url}")
 
+    source_params = dict(params)
+    source_params["api_key"] = "REDACTED"
     lines.append("Sources:")
-    lines.append(f"- {base_search_url}?{urlencode(params)}")
+    lines.append(f"- {base_search_url}?{urlencode(source_params)}")
     return truncate_text(
         "\n".join(lines).strip(),
         max_chars=max(1, int(limits.max_chars)),
@@ -595,6 +597,7 @@ def prefetch_bea(
 
     lines: list[str] = []
     lines.append("Free data sources (BEA API / NIPA):")
+    appended_any = False
     for spec in specs:
         params = {
             "UserID": api_key,
@@ -662,7 +665,13 @@ def prefetch_bea(
         for period, value in last_rows:
             lines.append(f"  - {period}: {value:g}")
         lines.append("  - Source:")
-        lines.append(f"    - {base_url}?{urlencode(params)}")
+        source_params = dict(params)
+        source_params["UserID"] = "REDACTED"
+        lines.append(f"    - {base_url}?{urlencode(source_params)}")
+        appended_any = True
+
+    if not appended_any:
+        return ""
 
     return truncate_text(
         "\n".join(lines).strip(),
@@ -707,14 +716,16 @@ def prefetch_eia(
     if not selected:
         return ""
 
-    base_url = "https://api.eia.gov/series/"
+    base_url = "https://api.eia.gov/v2/seriesid/"
     lines: list[str] = []
     lines.append("Free data sources (EIA series):")
+    appended_any = False
     for series_id, label in selected:
-        params = {"api_key": api_key, "series_id": series_id}
+        url = f"{base_url}{series_id}"
+        params = {"api_key": api_key}
         try:
             resp = requests.get(
-                base_url,
+                url,
                 params=params,
                 timeout=max(1, int(limits.timeout_seconds)),
                 headers=_ua_headers(),
@@ -725,26 +736,32 @@ def prefetch_eia(
             logger.debug("EIA fetch failed for %s", series_id, exc_info=True)
             continue
 
-        series_list = data.get("series")
-        if not isinstance(series_list, list) or not series_list:
+        response = data.get("response")
+        if not isinstance(response, dict):
             continue
-        entry = series_list[0] if isinstance(series_list[0], dict) else {}
-        raw_data = entry.get("data")
+        raw_data = response.get("data")
         if not isinstance(raw_data, list) or not raw_data:
             continue
 
         lines.append(f"- {label} ({series_id}):")
         for row in raw_data[: max(1, int(limits.max_points))]:
-            if not isinstance(row, list) or len(row) < 2:
+            if not isinstance(row, dict):
                 continue
-            date_raw = str(row[0] or "").strip()
-            value = row[1]
-            when = date_raw
-            if re.fullmatch(r"\d{8}", date_raw):
-                when = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
-            lines.append(f"  - {when}: {value}")
+            period = str(row.get("period") or "").strip()
+            value = row.get("value")
+            if not period:
+                continue
+            if value is None:
+                continue
+            lines.append(f"  - {period}: {value}")
         lines.append("  - Source:")
-        lines.append(f"    - {base_url}?{urlencode(params)}")
+        source_params = dict(params)
+        source_params["api_key"] = "REDACTED"
+        lines.append(f"    - {url}?{urlencode(source_params)}")
+        appended_any = True
+
+    if not appended_any:
+        return ""
 
     return truncate_text(
         "\n".join(lines).strip(),
