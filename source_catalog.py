@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -188,3 +189,172 @@ def apply_patch_ops(
     else:
         base["updated_at"] = str(original_updated_at or base.get("updated_at") or _now_iso())
     return base, summary
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]{3,}", re.IGNORECASE)
+_DEFAULT_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "will",
+    "would",
+    "should",
+    "could",
+    "into",
+    "over",
+    "under",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "how",
+    "are",
+    "was",
+    "were",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "also",
+    "than",
+    "then",
+    "there",
+    "their",
+    "they",
+    "them",
+    "you",
+    "your",
+    "our",
+    "ours",
+    "we",
+    "us",
+    "its",
+    "it's",
+    "in",
+    "on",
+    "to",
+    "of",
+    "a",
+    "an",
+    "as",
+    "at",
+    "by",
+    "or",
+    "not",
+    "is",
+    "it",
+}
+
+
+def _url_domain(url: str) -> str:
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    return host
+
+
+def _tokenize(text: str) -> set[str]:
+    if not text:
+        return set()
+    tokens = {t.lower() for t in _TOKEN_RE.findall(text)}
+    return {t for t in tokens if t and t not in _DEFAULT_STOPWORDS}
+
+
+def suggest_sources_for_question(
+    catalog: dict[str, Any],
+    *,
+    query_text: str,
+    max_items: int = 15,
+) -> list[dict[str, Any]]:
+    """
+    Deterministically select a small set of relevant catalog entries for a question.
+
+    Scoring is intentionally simple: overlap between question tokens and entry text (title/notes/tags/domain).
+    """
+    max_items = max(0, int(max_items))
+    if max_items <= 0:
+        return []
+
+    sources = catalog.get("sources", [])
+    if not isinstance(sources, list) or not sources:
+        return []
+
+    query_tokens = _tokenize(query_text)
+
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for entry in sources:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip()
+        if not _is_valid_url(url):
+            continue
+        title = str(entry.get("title") or "").strip()
+        notes = str(entry.get("notes") or "").strip()
+        tags = entry.get("tags")
+        tag_text = " ".join([str(t) for t in tags if isinstance(t, str)]) if isinstance(tags, list) else ""
+        domain = _url_domain(url)
+
+        entry_text = " ".join([title, notes, tag_text, domain]).strip()
+        if not entry_text:
+            score = 0
+        else:
+            entry_tokens = _tokenize(entry_text)
+            score = len(query_tokens & entry_tokens) if query_tokens else 0
+
+        scored.append((int(score), url, dict(entry)))
+
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [e for _, _, e in scored[:max_items]]
+
+
+def render_sources_markdown(
+    sources: list[dict[str, Any]],
+    *,
+    max_chars: int = 2500,
+) -> tuple[str, list[str]]:
+    """
+    Render a compact markdown-ish block for LLM prompts.
+
+    Returns (text, urls_included).
+    """
+    max_chars = max(0, int(max_chars))
+    if max_chars <= 0 or not sources:
+        return "", []
+
+    lines: list[str] = []
+    urls: list[str] = []
+    for entry in sources:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip()
+        if not _is_valid_url(url):
+            continue
+        title = str(entry.get("title") or "").strip()
+        notes = str(entry.get("notes") or "").strip()
+        tags = entry.get("tags")
+        tag_list = [str(t).strip().lower() for t in tags if str(t).strip()] if isinstance(tags, list) else []
+        tag_part = f" [{', '.join(tag_list)}]" if tag_list else ""
+        title_part = f"{title}{tag_part}" if title else f"{url}{tag_part}"
+        line = f"- {title_part}: {url}"
+        if notes:
+            line += f" — {notes}"
+        lines.append(line)
+        urls.append(url)
+        if len("\n".join(lines)) >= max_chars:
+            break
+
+    text = "\n".join(lines).strip()
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n[TRUNCATED]"
+    return text, urls
