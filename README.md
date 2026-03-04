@@ -78,7 +78,8 @@ To review newly-resolved questions on a schedule (e.g. weekend), use `--mode wee
 ## Research providers (AskNews / others)
 - AskNews research is optional. If your AskNews plan does not allow API access, runs may fail unless you disable it.
 - Disable research (cheapest/minimal): `poetry run python main.py --mode tournament --tournament climate --no-submit --researcher no_research`
-- Use web search (requires `EXA_API_KEY` or `PERPLEXITY_API_KEY`): `poetry run python main.py --mode tournament --tournament climate --no-submit --researcher smart-searcher/openrouter/openai/gpt-oss-120b:free`
+- Use web search via Tavily (requires `TAVILY_API_KEY`): `poetry run python main.py --mode tournament --tournament climate --no-submit --researcher tavily-searcher/openrouter/openai/gpt-oss-120b:free`
+- Use web search via Exa (requires `EXA_API_KEY`): `poetry run python main.py --mode tournament --tournament climate --no-submit --researcher smart-searcher/openrouter/openai/gpt-oss-120b:free`
 - Optional: tool-router (enabled by default) decides which sources to fetch per question (adds ~1 extra non-search LLM call per question):
   - Local crawl (if enabled) runs first, then free official sources (SEC/Nasdaq), then web search only if needed.
   - Disable with `BOT_ENABLE_TOOL_ROUTER=false`.
@@ -137,6 +138,9 @@ poetry run playwright install chromium
 Running the bot requires various environment variables. If you run the bot locally, the easiest way to set them is to create a file called `.env` in the root directory of the repository (copy the `.env.template`).
 
 Note: `METACULUS_TOKEN` should be the raw token value (no `Token ` / `Bearer ` prefix).
+
+Optional: GitHub token (for publishing reports)
+- Some modes (e.g. weekly retrospective) can publish reports/patches back to GitHub. Provide a token via `GH_TOKEN_MetaculusBot` (or `GH_TOKEN` / `GITHUB_TOKEN`) and optionally set `BOT_GITHUB_REPO`.
 
 ### Running the bot
 

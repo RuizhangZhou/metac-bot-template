@@ -25,6 +25,7 @@ from typing import Sequence
 from bot.env import env_bool as _env_bool, env_float as _env_float, env_int as _env_int
 from bot.local_crawl_support import LocalCrawlSupportMixin
 from bot.smart_searcher_circuit import SmartSearcherCircuitMixin
+from bot.tavily_searcher import TavilySmartSearcher
 from bot.tool_router import ToolRouterMixin, ToolRouterPlan
 
 import requests
@@ -959,8 +960,16 @@ class MetaculusBot(
             merged_base_kwargs = {**base_llm_kwargs, **extra_kwargs}
 
             researcher: str | GeneralLlm
-            if enable_web_search and os.getenv("EXA_API_KEY"):
-                # Prefer Exa + SmartSearcher (no paid "search-preview" models required).
+            if enable_web_search and os.getenv("TAVILY_API_KEY"):
+                # Prefer Tavily first (monthly free-tier reset) + local SmartSearcher-like flow
+                # (no paid "search-preview" models required).
+                researcher = (
+                    "tavily-searcher/kiconnect"
+                    if has_kiconnect
+                    else "tavily-searcher/openrouter/openai/gpt-oss-120b:free"
+                )
+            elif enable_web_search and os.getenv("EXA_API_KEY"):
+                # Fall back to Exa + SmartSearcher (often a one-time free credit pool).
                 researcher = (
                     "smart-searcher/kiconnect"
                     if has_kiconnect
@@ -2456,6 +2465,7 @@ class MetaculusBot(
                 "search-preview" in researcher_model_name_lower
                 or researcher_model_name_lower.startswith("perplexity/")
                 or researcher_model_name_lower.startswith("smart-searcher/")
+                or researcher_model_name_lower.startswith("tavily-searcher/")
                 or researcher_model_name_lower.startswith("asknews/")
             )
             use_web_search_for_call = bool(tool_plan.use_web_search)
@@ -2638,52 +2648,385 @@ class MetaculusBot(
                             f"AskNews research failed, continuing without it: {error_text}"
                         )
                     research = ""
+            elif isinstance(researcher, str) and researcher.startswith("tavily-searcher"):
+                fallback_research = "\n\n".join(
+                    [part for part in [local_crawl_block, official_block] if part]
+                ).strip()
+                model_name = researcher.removeprefix("tavily-searcher/")
+                model_name_lower = model_name.strip().lower()
+                if model_name_lower == "kiconnect" or model_name_lower.startswith(
+                    "kiconnect/"
+                ):
+                    kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
+                    kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "").strip()
+                    kiconnect_model = os.getenv("KICONNECT_MODEL", "").strip()
+                    if not (kiconnect_api_url and kiconnect_api_key and kiconnect_model):
+                        raise ValueError(
+                            "tavily-searcher/kiconnect requested but KICONNECT_API_URL/KICONNECT_API_KEY/KICONNECT_MODEL are not all set."
+                        )
+                    ssl_verify = self._parse_ssl_verify_env("KICONNECT_SSL_VERIFY")
+                    search_llm_kwargs: dict = {}
+                    if ssl_verify is not None:
+                        search_llm_kwargs["ssl_verify"] = ssl_verify
+                    override_model = None
+                    if "/" in model_name:
+                        _, override_model = model_name.split("/", 1)
+                        override_model = override_model.strip() or None
+                    search_llm = GeneralLlm(
+                        model=f"openai/{override_model or kiconnect_model}",
+                        temperature=0,
+                        base_url=kiconnect_api_url,
+                        api_key=kiconnect_api_key,
+                        custom_llm_provider="openai",
+                        **search_llm_kwargs,
+                    )
+                    model_name = search_llm
+
+                try:
+                    num_searches_to_run = int(os.getenv("SMART_SEARCHER_NUM_SEARCHES", "2"))
+                except Exception:
+                    num_searches_to_run = 2
+                try:
+                    num_sites_per_search = int(
+                        os.getenv("SMART_SEARCHER_NUM_SITES_PER_SEARCH", "10")
+                    )
+                except Exception:
+                    num_sites_per_search = 10
+                use_advanced_filters = (
+                    os.getenv("SMART_SEARCHER_USE_ADVANCED_FILTERS", "")
+                    .strip()
+                    .lower()
+                    in {"1", "true", "yes", "y"}
+                )
+
+                disabled_reason = getattr(self, "_tavily_searcher_disabled_reason", None)
+                if disabled_reason:
+                    exa_key = os.getenv("EXA_API_KEY", "").strip()
+                    exa_disabled = getattr(self, "_smart_searcher_disabled_reason", None)
+                    if exa_key and not exa_disabled:
+                        logger.warning(
+                            "TavilySearcher disabled (%s). Falling back to Exa for %s.",
+                            disabled_reason,
+                            question.page_url,
+                        )
+                        try:
+                            research = await SmartSearcher(
+                                model=model_name,
+                                temperature=0,
+                                num_searches_to_run=max(1, num_searches_to_run),
+                                num_sites_per_search=max(1, num_sites_per_search),
+                                use_advanced_filters=use_advanced_filters,
+                            ).invoke(prompt)
+                            self._smart_searcher_consecutive_failures = 0
+                        except Exception as e:
+                            logger.warning(
+                                "Exa fallback failed; continuing without web search for %s. Error: %s",
+                                question.page_url,
+                                repr(e)[:300],
+                            )
+                            research = fallback_research
+                    else:
+                        logger.warning(
+                            "TavilySearcher disabled (%s). Continuing without web search for %s.",
+                            disabled_reason,
+                            question.page_url,
+                        )
+                        research = fallback_research
+                else:
+                    tavily_depth = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip()
+                    tavily_topic = os.getenv("TAVILY_TOPIC", "general").strip()
+                    tavily_time_range = os.getenv("TAVILY_TIME_RANGE", "").strip() or None
+                    tavily_include_raw = _env_bool("TAVILY_INCLUDE_RAW_CONTENT", False)
+                    tavily_timeout = float(_env_float("TAVILY_TIMEOUT_SECONDS", 30.0))
+
+                    max_provider_failures = _env_int(
+                        "BOT_SMART_SEARCHER_MAX_CONSECUTIVE_FAILURES", 2
+                    )
+
+                    candidate_models: list[str | GeneralLlm] = [model_name]
+                    if isinstance(model_name, GeneralLlm):
+                        candidate_models.extend(
+                            self._make_kiconnect_fallback_llms_from_llm(model_name)
+                        )
+                        fallback_search_model_name = self._fallback_model_name_for(
+                            model_name.model
+                        )
+                        if (
+                            fallback_search_model_name
+                            and fallback_search_model_name != model_name.model
+                        ):
+                            candidate_models.append(
+                                GeneralLlm(
+                                    model=fallback_search_model_name, temperature=0
+                                )
+                            )
+
+                    seen: set[str] = set()
+                    deduped_models: list[str | GeneralLlm] = []
+                    for candidate in candidate_models:
+                        candidate_name = GeneralLlm.to_model_name(candidate)
+                        if candidate_name in seen:
+                            continue
+                        seen.add(candidate_name)
+                        deduped_models.append(candidate)
+
+                    last_error: BaseException | None = None
+                    provider_error: BaseException | None = None
+                    for idx, candidate in enumerate(deduped_models, start=1):
+                        searcher = TavilySmartSearcher(
+                            model=candidate,
+                            temperature=0,
+                            num_searches_to_run=max(1, num_searches_to_run),
+                            num_sites_per_search=max(1, num_sites_per_search),
+                            search_depth=tavily_depth,
+                            topic=tavily_topic,
+                            time_range=tavily_time_range,
+                            include_raw_content=tavily_include_raw,
+                            timeout_seconds=tavily_timeout,
+                        )
+                        try:
+                            research = await searcher.invoke(prompt)
+                            self._tavily_searcher_consecutive_failures = 0
+                            break
+                        except BaseException as e:
+                            last_error = e
+                            if self._is_probably_tavily_error(e):
+                                provider_error = e
+                                break
+                            if not self._is_transient_provider_error(e):
+                                raise
+                            if idx >= len(deduped_models):
+                                raise
+                            logger.warning(
+                                "TavilySearcher (%s): search model '%s' failed; retrying with fallback search model #%s '%s'. Error: %s",
+                                question.page_url,
+                                GeneralLlm.to_model_name(candidate),
+                                idx,
+                                GeneralLlm.to_model_name(deduped_models[idx]),
+                                e,
+                            )
+                    else:
+                        raise last_error if last_error is not None else RuntimeError(
+                            "TavilySearcher failed without an exception"
+                        )
+
+                    if provider_error is not None:
+                        if self._is_tavily_nonrecoverable_error(provider_error):
+                            reason = f"nonrecoverable Tavily error: {provider_error.__class__.__name__}"
+                            self._tavily_searcher_disabled_reason = reason
+                            if tool_trace is not None:
+                                tool_trace_record_value(
+                                    tool_trace,
+                                    key="tavily_searcher_disabled_reason",
+                                    value=reason,
+                                )
+                            logger.warning(
+                                "TavilySearcher disabled (%s). Continuing without web search for %s. Error: %s",
+                                reason,
+                                question.page_url,
+                                repr(provider_error)[:300],
+                            )
+                        else:
+                            self._tavily_searcher_consecutive_failures = (
+                                getattr(self, "_tavily_searcher_consecutive_failures", 0)
+                                + 1
+                            )
+                            if (
+                                max_provider_failures > 0
+                                and self._tavily_searcher_consecutive_failures
+                                >= max_provider_failures
+                            ):
+                                reason = f"Tavily failures >= {max_provider_failures}"
+                                self._tavily_searcher_disabled_reason = reason
+                                if tool_trace is not None:
+                                    tool_trace_record_value(
+                                        tool_trace,
+                                        key="tavily_searcher_disabled_reason",
+                                        value=reason,
+                                    )
+                                logger.warning(
+                                    "TavilySearcher disabled (%s) after repeated Tavily failures. Continuing without web search for %s. Error: %s",
+                                    reason,
+                                    question.page_url,
+                                    repr(provider_error)[:300],
+                                )
+                            else:
+                                logger.warning(
+                                    "TavilySearcher error for %s (consecutive failures=%s). Continuing without web search for this question. Error: %s",
+                                    question.page_url,
+                                    self._tavily_searcher_consecutive_failures,
+                                    repr(provider_error)[:300],
+                                )
+                        exa_key = os.getenv("EXA_API_KEY", "").strip()
+                        exa_disabled = getattr(self, "_smart_searcher_disabled_reason", None)
+                        if exa_key and not exa_disabled:
+                            logger.warning(
+                                "Falling back to Exa for %s after Tavily failure.",
+                                question.page_url,
+                            )
+                            try:
+                                research = await SmartSearcher(
+                                    model=model_name,
+                                    temperature=0,
+                                    num_searches_to_run=max(1, num_searches_to_run),
+                                    num_sites_per_search=max(1, num_sites_per_search),
+                                    use_advanced_filters=use_advanced_filters,
+                                ).invoke(prompt)
+                                self._smart_searcher_consecutive_failures = 0
+                            except BaseException as e:
+                                if self._is_probably_exa_error(e):
+                                    if self._is_exa_nonrecoverable_error(e):
+                                        reason = f"nonrecoverable Exa error: {e.__class__.__name__}"
+                                        self._smart_searcher_disabled_reason = reason
+                                        if tool_trace is not None:
+                                            tool_trace_record_value(
+                                                tool_trace,
+                                                key="smart_searcher_disabled_reason",
+                                                value=reason,
+                                            )
+                                        logger.warning(
+                                            "SmartSearcher disabled (%s). Continuing without web search for %s. Error: %s",
+                                            reason,
+                                            question.page_url,
+                                            repr(e)[:300],
+                                        )
+                                    else:
+                                        max_exa_failures = _env_int(
+                                            "BOT_SMART_SEARCHER_MAX_CONSECUTIVE_FAILURES", 2
+                                        )
+                                        self._smart_searcher_consecutive_failures += 1
+                                        if (
+                                            max_exa_failures > 0
+                                            and self._smart_searcher_consecutive_failures
+                                            >= max_exa_failures
+                                        ):
+                                            reason = f"Exa failures >= {max_exa_failures}"
+                                            self._smart_searcher_disabled_reason = reason
+                                            if tool_trace is not None:
+                                                tool_trace_record_value(
+                                                    tool_trace,
+                                                    key="smart_searcher_disabled_reason",
+                                                    value=reason,
+                                                )
+                                            logger.warning(
+                                                "SmartSearcher disabled (%s) after repeated Exa failures. Continuing without web search for %s. Error: %s",
+                                                reason,
+                                                question.page_url,
+                                                repr(e)[:300],
+                                            )
+                                        else:
+                                            logger.warning(
+                                                "SmartSearcher Exa error for %s (consecutive failures=%s). Continuing without web search for this question. Error: %s",
+                                                question.page_url,
+                                                self._smart_searcher_consecutive_failures,
+                                                repr(e)[:300],
+                                            )
+                                else:
+                                    logger.warning(
+                                        "Exa fallback failed; continuing without web search for %s. Error: %s",
+                                        question.page_url,
+                                        repr(e)[:300],
+                                    )
+                                research = fallback_research
+                        else:
+                            research = fallback_research
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
                 fallback_research = "\n\n".join(
                     [part for part in [local_crawl_block, official_block] if part]
                 ).strip()
+                model_name = researcher.removeprefix("smart-searcher/")
+                model_name_lower = model_name.strip().lower()
+                if model_name_lower == "kiconnect" or model_name_lower.startswith(
+                    "kiconnect/"
+                ):
+                    kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
+                    kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "").strip()
+                    kiconnect_model = os.getenv("KICONNECT_MODEL", "").strip()
+                    if not (kiconnect_api_url and kiconnect_api_key and kiconnect_model):
+                        raise ValueError(
+                            "smart-searcher/kiconnect requested but KICONNECT_API_URL/KICONNECT_API_KEY/KICONNECT_MODEL are not all set."
+                        )
+                    ssl_verify = self._parse_ssl_verify_env("KICONNECT_SSL_VERIFY")
+                    search_llm_kwargs: dict = {}
+                    if ssl_verify is not None:
+                        search_llm_kwargs["ssl_verify"] = ssl_verify
+                    override_model = None
+                    if "/" in model_name:
+                        _, override_model = model_name.split("/", 1)
+                        override_model = override_model.strip() or None
+                    search_llm = GeneralLlm(
+                        model=f"openai/{override_model or kiconnect_model}",
+                        temperature=0,
+                        base_url=kiconnect_api_url,
+                        api_key=kiconnect_api_key,
+                        custom_llm_provider="openai",
+                        **search_llm_kwargs,
+                    )
+                    model_name = search_llm
                 disabled_reason = getattr(self, "_smart_searcher_disabled_reason", None)
                 if disabled_reason:
-                    logger.warning(
-                        "SmartSearcher disabled (%s). Continuing without web search for %s.",
-                        disabled_reason,
-                        question.page_url,
+                    tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+                    tavily_disabled = getattr(
+                        self, "_tavily_searcher_disabled_reason", None
                     )
-                    research = fallback_research
-                else:
-                    model_name = researcher.removeprefix("smart-searcher/")
-                    model_name_lower = model_name.strip().lower()
-                    if model_name_lower == "kiconnect" or model_name_lower.startswith(
-                        "kiconnect/"
-                    ):
-                        kiconnect_api_url = os.getenv("KICONNECT_API_URL", "").strip()
-                        kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "").strip()
-                        kiconnect_model = os.getenv("KICONNECT_MODEL", "").strip()
-                        if not (
-                            kiconnect_api_url and kiconnect_api_key and kiconnect_model
-                        ):
-                            raise ValueError(
-                                "smart-searcher/kiconnect requested but KICONNECT_API_URL/KICONNECT_API_KEY/KICONNECT_MODEL are not all set."
+                    if tavily_key and not tavily_disabled:
+                        try:
+                            num_searches_to_run = int(
+                                os.getenv("SMART_SEARCHER_NUM_SEARCHES", "2")
                             )
-                        ssl_verify = self._parse_ssl_verify_env("KICONNECT_SSL_VERIFY")
-                        search_llm_kwargs: dict = {}
-                        if ssl_verify is not None:
-                            search_llm_kwargs["ssl_verify"] = ssl_verify
-                        override_model = None
-                        if "/" in model_name:
-                            _, override_model = model_name.split("/", 1)
-                            override_model = override_model.strip() or None
-                        search_llm = GeneralLlm(
-                            model=f"openai/{override_model or kiconnect_model}",
-                            temperature=0,
-                            base_url=kiconnect_api_url,
-                            api_key=kiconnect_api_key,
-                            # Ensure LiteLLM treats unknown model names as OpenAI-compatible
-                            # (important for KICONNECT_MODEL_FALLBACKS like gpt-oss-*).
-                            custom_llm_provider="openai",
-                            **search_llm_kwargs,
+                        except Exception:
+                            num_searches_to_run = 2
+                        try:
+                            num_sites_per_search = int(
+                                os.getenv("SMART_SEARCHER_NUM_SITES_PER_SEARCH", "10")
+                            )
+                        except Exception:
+                            num_sites_per_search = 10
+
+                        tavily_depth = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip()
+                        tavily_topic = os.getenv("TAVILY_TOPIC", "general").strip()
+                        tavily_time_range = (
+                            os.getenv("TAVILY_TIME_RANGE", "").strip() or None
                         )
-                        model_name = search_llm
+                        tavily_include_raw = _env_bool(
+                            "TAVILY_INCLUDE_RAW_CONTENT", False
+                        )
+                        tavily_timeout = float(
+                            _env_float("TAVILY_TIMEOUT_SECONDS", 30.0)
+                        )
+
+                        logger.warning(
+                            "SmartSearcher disabled (%s). Falling back to Tavily for %s.",
+                            disabled_reason,
+                            question.page_url,
+                        )
+                        try:
+                            research = await TavilySmartSearcher(
+                                model=model_name,
+                                temperature=0,
+                                num_searches_to_run=max(1, num_searches_to_run),
+                                num_sites_per_search=max(1, num_sites_per_search),
+                                search_depth=tavily_depth,
+                                topic=tavily_topic,
+                                time_range=tavily_time_range,
+                                include_raw_content=tavily_include_raw,
+                                timeout_seconds=tavily_timeout,
+                            ).invoke(prompt)
+                        except Exception as e:
+                            logger.warning(
+                                "Tavily fallback failed; continuing without web search for %s. Error: %s",
+                                question.page_url,
+                                repr(e)[:300],
+                            )
+                            research = fallback_research
+                    else:
+                        logger.warning(
+                            "SmartSearcher disabled (%s). Continuing without web search for %s.",
+                            disabled_reason,
+                            question.page_url,
+                        )
+                        research = fallback_research
+                else:
                     try:
                         num_searches_to_run = int(
                             os.getenv("SMART_SEARCHER_NUM_SEARCHES", "2")
@@ -2780,6 +3123,51 @@ class MetaculusBot(
                                 question.page_url,
                                 repr(exa_error)[:300],
                             )
+
+                            tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+                            tavily_disabled = getattr(
+                                self, "_tavily_searcher_disabled_reason", None
+                            )
+                            if tavily_key and not tavily_disabled:
+                                tavily_depth = os.getenv(
+                                    "TAVILY_SEARCH_DEPTH", "basic"
+                                ).strip()
+                                tavily_topic = os.getenv("TAVILY_TOPIC", "general").strip()
+                                tavily_time_range = (
+                                    os.getenv("TAVILY_TIME_RANGE", "").strip() or None
+                                )
+                                tavily_include_raw = _env_bool(
+                                    "TAVILY_INCLUDE_RAW_CONTENT", False
+                                )
+                                tavily_timeout = float(
+                                    _env_float("TAVILY_TIMEOUT_SECONDS", 30.0)
+                                )
+                                logger.warning(
+                                    "Falling back to Tavily for %s after Exa failure.",
+                                    question.page_url,
+                                )
+                                try:
+                                    research = await TavilySmartSearcher(
+                                        model=candidate,
+                                        temperature=0,
+                                        num_searches_to_run=max(1, num_searches_to_run),
+                                        num_sites_per_search=max(1, num_sites_per_search),
+                                        search_depth=tavily_depth,
+                                        topic=tavily_topic,
+                                        time_range=tavily_time_range,
+                                        include_raw_content=tavily_include_raw,
+                                        timeout_seconds=tavily_timeout,
+                                    ).invoke(prompt)
+                                    self._tavily_searcher_consecutive_failures = 0
+                                except Exception as e:
+                                    logger.warning(
+                                        "Tavily fallback failed; continuing without web search for %s. Error: %s",
+                                        question.page_url,
+                                        repr(e)[:300],
+                                    )
+                                    research = fallback_research
+                            else:
+                                research = fallback_research
                         else:
                             self._smart_searcher_consecutive_failures += 1
                             if (
@@ -2808,7 +3196,7 @@ class MetaculusBot(
                                     self._smart_searcher_consecutive_failures,
                                     repr(exa_error)[:300],
                                 )
-                        research = fallback_research
+                            research = fallback_research
             else:
                 research = await self._invoke_llm_with_transient_fallback(
                     "researcher", prompt, context=f"Research ({question.page_url})"
