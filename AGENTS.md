@@ -9,6 +9,11 @@
 ## Secrets
 - Never print or paste any tokens/keys/secrets in responses or logs.
 
+## GitHub auth (for automation)
+- Some modes/scripts may call GitHub APIs (e.g. publish weekly retrospective reports via `github_contents.py`).
+- Token env var precedence: `GH_TOKEN_MetaculusBot` → `GH_TOKEN` → `GITHUB_TOKEN` (see `github_contents.get_github_token()`).
+- On this server, the token is commonly stored in `~/.openclaw/.env` under `GH_TOKEN_MetaculusBot` (do not commit it; do not print it).
+
 ## Commit message convention
 - Include explicit identifiers for both the issue and PR to avoid ambiguity (GitHub uses `#<number>` for both).
 - Format: `<type>: <summary> (issue #<issue>, PR #<pr>)`

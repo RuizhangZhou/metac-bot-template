@@ -183,7 +183,8 @@ if __name__ == "__main__":
         help=(
             "Override research strategy/model. Examples: "
             "'no_research', 'free/nasdaq-eps', 'asknews/news-summaries', "
-            "'asknews/deep-research/low-depth', 'smart-searcher/<model>'."
+            "'asknews/deep-research/low-depth', 'smart-searcher/<model>', "
+            "'tavily-searcher/<model>'."
         ),
     )
     parser.add_argument(
