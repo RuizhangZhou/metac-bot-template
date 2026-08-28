@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tournament:
-        description: "Tournament slug or URL (default: MARKET_PULSE_TOURNAMENT var or market-pulse-26q3)"
+        description: "Tournament slug or URL. Empty = MARKET_PULSE_TOURNAMENT var, or auto-discover the running quarter."
         required: false
         default: ""
         type: string
@@ -109,7 +109,7 @@ jobs:
           SMART_SEARCHER_NUM_SITES_PER_SEARCH="${{ github.event.inputs.smart_searcher_num_sites_per_search }}"
           SMART_SEARCHER_USE_ADVANCED_FILTERS="${{ github.event.inputs.smart_searcher_use_advanced_filters }}"
 
-          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${MARKET_PULSE_TOURNAMENT:-market-pulse-26q3}"; fi
+          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${MARKET_PULSE_TOURNAMENT:-auto}"; fi
           if [ -z "$RESEARCHER" ]; then RESEARCHER="tavily-searcher/kiconnect"; fi
           if [ -z "$SMART_SEARCHER_NUM_SEARCHES" ]; then SMART_SEARCHER_NUM_SEARCHES="3"; fi
           if [ -z "$SMART_SEARCHER_NUM_SITES_PER_SEARCH" ]; then SMART_SEARCHER_NUM_SITES_PER_SEARCH="8"; fi
@@ -231,7 +231,7 @@ jobs:
         run: |
           set -o pipefail
           TOURNAMENT="${{ github.event.inputs.tournament }}"
-          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${MARKET_PULSE_TOURNAMENT:-market-pulse-26q3}"; fi
+          if [ -z "$TOURNAMENT" ]; then TOURNAMENT="${MARKET_PULSE_TOURNAMENT:-auto}"; fi
           poetry run python main.py --mode retrospective --tournament "$TOURNAMENT" | tee retrospective_summary.md | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "${MATRIX_NOTIFY_RETROSPECTIVE:-true}" = "true" ]; then
             poetry run python - <<'PY'
