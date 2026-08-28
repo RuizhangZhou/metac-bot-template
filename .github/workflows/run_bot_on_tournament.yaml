@@ -1,10 +1,10 @@
-name: Forecast on Tournaments (Summer FutureEval + minibench)
+name: Forecast on Tournaments (seasonal bot tournament + minibench)
 
 on:
   workflow_dispatch:
     inputs:
       tournament:
-        description: "Single tournament to run (leave empty for Summer FutureEval + minibench)"
+        description: "Single tournament to run. Empty = the running seasonal bot tournament + minibench."
         required: false
         default: ""
         type: string
@@ -124,8 +124,8 @@ jobs:
             TOURNAMENTS=("$MANUAL_TOURNAMENT")
           else
             TOURNAMENTS=(
-              "${BOT_TOURNAMENT:-summer-futureeval-2026}"
-              "https://www.metaculus.com/tournament/minibench/"
+              "${BOT_TOURNAMENT:-auto:futureeval}"
+              "auto:minibench"
             )
           fi
 

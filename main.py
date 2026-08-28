@@ -16,6 +16,7 @@ from digest_mode import (
     matrix_send_message,
     run_digest,
 )
+from tournament_resolver import expand_identifiers
 from tournament_update import select_questions_for_tournament_update
 from forecasting_tools import GeneralLlm, MetaculusClient
 
@@ -117,6 +118,28 @@ def _validate_and_normalize_metaculus_token() -> None:
         )
         matrix_send_message(f"Metaculus bot error: {message}")
         raise SystemExit(message)
+
+
+def _resolve_tournaments(identifiers: list[str], *, family: str) -> list[str]:
+    """Turn any ``auto`` marker into the tournament that is actually running.
+
+    Explicit slugs are passed through, so pinning one still works. Failing to
+    reach the API is fatal on purpose: forecasting against a stale hard-coded
+    slug looks like success (exit 0, ``total_open=0``) and is how this bot once
+    forecast nothing for 149 days.
+    """
+    try:
+        resolved = expand_identifiers(identifiers, default_family=family)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a clean exit below
+        raise SystemExit(
+            f"Could not resolve tournaments {identifiers} (family={family}): {exc!r}"
+        ) from exc
+    if not resolved:
+        raise SystemExit(
+            f"No running tournament for {identifiers} (family={family}). "
+            "If a season just ended this may be correct, but check before ignoring it."
+        )
+    return resolved
 
 
 def _env_int(name: str, default: int) -> int:
@@ -431,15 +454,16 @@ if __name__ == "__main__":
                 raise SystemExit(
                     "No valid tournaments configured via --tournaments-file/--tournament."
                 )
+            tournaments = _resolve_tournaments(tournaments, family="market-pulse")
         else:
             market_pulse_env = os.getenv("MARKET_PULSE_TOURNAMENT", "").strip()
-            default_raw = market_pulse_env or client.CURRENT_MARKET_PULSE_ID
+            default_raw = market_pulse_env or "auto:market-pulse"
             default_id = extract_tournament_identifier(default_raw)
             if not default_id or default_id.startswith("index:"):
                 raise SystemExit(
                     "No tournament specified. Set MARKET_PULSE_TOURNAMENT or pass --tournament."
                 )
-            tournaments = [default_id]
+            tournaments = _resolve_tournaments([default_id], family="market-pulse")
 
         out_dir = Path("reports") / "retrospective"
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -472,10 +496,10 @@ if __name__ == "__main__":
                 )
         else:
             market_pulse_env = os.getenv("MARKET_PULSE_TOURNAMENT", "").strip()
-            market_raw = market_pulse_env or client.CURRENT_MARKET_PULSE_ID
+            market_raw = market_pulse_env or "auto:market-pulse"
             market_id = extract_tournament_identifier(market_raw)
 
-            aib_raw = os.getenv("AIB_TOURNAMENT", "").strip() or client.CURRENT_AI_COMPETITION_ID
+            aib_raw = os.getenv("AIB_TOURNAMENT", "").strip() or "auto:futureeval"
             aib_id = extract_tournament_identifier(aib_raw)
 
             minibench_id = extract_tournament_identifier(client.CURRENT_MINIBENCH_ID)
@@ -486,11 +510,14 @@ if __name__ == "__main__":
             )
             cup_id = extract_tournament_identifier(cup_raw)
 
-            tournaments = [
-                t
-                for t in [market_id, aib_id, minibench_id, cup_id]
-                if t and not t.startswith("index:")
-            ]
+            tournaments = _resolve_tournaments(
+                [
+                    t
+                    for t in [market_id, aib_id, minibench_id, cup_id]
+                    if t and not t.startswith("index:")
+                ],
+                family="market-pulse",
+            )
             if not tournaments:
                 raise SystemExit(
                     "No tournaments configured for weekly_retrospective. Set MARKET_PULSE_TOURNAMENT/AIB_TOURNAMENT/METACULUS_CUP_TOURNAMENT or pass --tournament."
@@ -601,6 +628,7 @@ if __name__ == "__main__":
                     raise SystemExit(
                         "No valid tournaments configured via --tournaments-file/--tournament."
                     )
+                tournaments = _resolve_tournaments(tournaments, family="futureeval")
                 questions, scan_failures = _collect_open_questions_from_tournaments(
                     client=client,
                     tournaments=tournaments,
@@ -615,10 +643,12 @@ if __name__ == "__main__":
                         )
                     )
             else:
-                default_tournaments = [
-                    client.CURRENT_AI_COMPETITION_ID,
-                    client.CURRENT_MINIBENCH_ID,
-                ]
+                # The seasonal bot tournament is renamed every season and
+                # MiniBench restarts every two weeks; resolve both rather than
+                # trusting a constant that goes stale silently.
+                default_tournaments = _resolve_tournaments(
+                    ["auto:futureeval", "auto:minibench"], family="futureeval"
+                )
                 questions, scan_failures = _collect_open_questions_from_tournaments(
                     client=client,
                     tournaments=default_tournaments,
@@ -648,15 +678,16 @@ if __name__ == "__main__":
                     raise SystemExit(
                         "No valid tournaments configured via --tournaments-file/--tournament."
                     )
+                tournaments = _resolve_tournaments(tournaments, family="market-pulse")
             else:
                 market_pulse_env = os.getenv("MARKET_PULSE_TOURNAMENT", "").strip()
-                default_raw = market_pulse_env or client.CURRENT_MARKET_PULSE_ID
+                default_raw = market_pulse_env or "auto:market-pulse"
                 default_id = extract_tournament_identifier(default_raw)
                 if not default_id or default_id.startswith("index:"):
                     raise SystemExit(
                         "No tournament specified. Set MARKET_PULSE_TOURNAMENT or pass --tournament."
                     )
-                tournaments = [default_id]
+                tournaments = _resolve_tournaments([default_id], family="market-pulse")
 
             for tournament_id in tournaments:
                 questions_to_forecast, counts = select_questions_for_tournament_update(
